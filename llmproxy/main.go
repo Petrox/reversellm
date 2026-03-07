@@ -258,7 +258,7 @@ func messageContent(v interface{}) string {
 		}
 		return strings.Join(parts, " ")
 	default:
-		return fmt.Sprintf("%v", v)
+		return ""
 	}
 }
 
@@ -266,10 +266,11 @@ func messageContent(v interface{}) string {
 // and last `n` characters. This captures both the type identity (prefix) and
 // session-specific uniqueness (suffix) without reading the entire content.
 func fingerprint(s string, n int) string {
-	if len(s) <= n*2 {
+	r := []rune(s)
+	if len(r) <= n*2 {
 		return s
 	}
-	return s[:n] + "|" + s[len(s)-n:]
+	return string(r[:n]) + "|" + string(r[len(r)-n:])
 }
 
 // extractRoutingKey builds a stable per-session routing key from the request body.
@@ -378,6 +379,9 @@ func extractRoutingKey(body []byte, fpLen int) routingResult {
 // Fix M4: prevents shell-injection / path-traversal via exec.Command args.
 func isValidHostname(hostname string) bool {
 	if hostname == "" {
+		return false
+	}
+	if strings.HasPrefix(hostname, "-") {
 		return false
 	}
 	for _, r := range hostname {
@@ -619,10 +623,11 @@ func securityHeaders(next http.Handler) http.Handler {
 // ipRateLimiter implements a per-IP token-bucket rate limiter.
 // Fix M2: prevents a single IP from exhausting backend capacity.
 type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*visitor
-	rps      float64
-	burst    int
+	mu          sync.Mutex
+	visitors    map[string]*visitor
+	rps         float64
+	burst       int
+	maxVisitors int
 }
 
 type visitor struct {
@@ -630,11 +635,12 @@ type visitor struct {
 	lastTime time.Time
 }
 
-func newIPRateLimiter(rps float64, burst int) *ipRateLimiter {
+func newIPRateLimiter(rps float64, burst int, maxVisitors int) *ipRateLimiter {
 	rl := &ipRateLimiter{
-		visitors: make(map[string]*visitor),
-		rps:      rps,
-		burst:    burst,
+		visitors:    make(map[string]*visitor),
+		rps:         rps,
+		burst:       burst,
+		maxVisitors: maxVisitors,
 	}
 	return rl
 }
@@ -646,6 +652,9 @@ func (rl *ipRateLimiter) Allow(ip string) bool {
 	now := time.Now()
 	v, exists := rl.visitors[ip]
 	if !exists {
+		if len(rl.visitors) >= rl.maxVisitors {
+			return false
+		}
 		rl.visitors[ip] = &visitor{tokens: float64(rl.burst) - 1, lastTime: now}
 		return true
 	}
@@ -691,6 +700,7 @@ type ProxyServer struct {
 	debug          bool           // enable verbose logging, stats endpoint, debug headers
 	maxRequestSize int64          // maximum allowed request body size in bytes
 	limiter        *ipRateLimiter // nil means unlimited
+	healthClient   *http.Client   // reused client for health checks (H4)
 
 	totalRequests    atomic.Int64
 	routedRequests   atomic.Int64
@@ -747,6 +757,14 @@ func NewProxyServer(listen string, backendAddrs []string, prefixLen int, healthP
 		b.healthy.Store(true)
 		ps.backends = append(ps.backends, b)
 		ps.ring.Add(originalHost)
+	}
+
+	ps.healthClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
 
 	return ps, nil
@@ -957,8 +975,10 @@ func (ps *ProxyServer) proxyTo(w http.ResponseWriter, r *http.Request, backend *
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[error] proxy to %s failed: %v (path: %s)", backend.Name, err, r.URL.Path)
 			if ps.debug {
+				msg := fmt.Sprintf("backend %s: %s", backend.Name, err)
+				escapedMsg, _ := json.Marshal(msg)
 				http.Error(w,
-					fmt.Sprintf(`{"error":{"message":"backend %s: %s","type":"proxy_error"}}`, backend.Name, err),
+					fmt.Sprintf(`{"error":{"message":%s,"type":"proxy_error"}}`, escapedMsg),
 					http.StatusBadGateway)
 			} else {
 				http.Error(w,
@@ -998,7 +1018,7 @@ func (ps *ProxyServer) startHealthChecker(ctx context.Context, interval time.Dur
 }
 
 func (ps *ProxyServer) checkAllBackends() {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := ps.healthClient
 	var wg sync.WaitGroup
 
 	for _, b := range ps.backends {
@@ -1029,6 +1049,7 @@ func (ps *ProxyServer) checkAllBackends() {
 					resp2, err2 := client.Get(retryURL)
 					if err2 == nil {
 						defer resp2.Body.Close()
+						io.Copy(io.Discard, resp2.Body)
 						if resp2.StatusCode >= 200 && resp2.StatusCode < 400 {
 							b.healthy.Store(true)
 							log.Printf("[health] %s -> HEALTHY after re-resolve (HTTP %d)", b.Name, resp2.StatusCode)
@@ -1038,6 +1059,7 @@ func (ps *ProxyServer) checkAllBackends() {
 				return
 			}
 			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 				b.healthy.Store(true)
@@ -1193,13 +1215,15 @@ Examples:
 
 	var limiter *ipRateLimiter
 	if *rateLimit > 0 {
-		limiter = newIPRateLimiter(float64(*rateLimit), *rateLimit*2)
+		limiter = newIPRateLimiter(float64(*rateLimit), *rateLimit*2, 10000)
 		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(1 * time.Minute):
+				case <-ticker.C:
 					limiter.cleanup()
 				}
 			}
@@ -1207,6 +1231,26 @@ Examples:
 		log.Printf("Rate limit: %d req/s per IP (burst: %d)", *rateLimit, *rateLimit*2)
 	}
 	proxy.limiter = limiter
+
+	log.Printf("llmproxy starting on %s", *listen)
+	log.Printf("Backends:")
+	for i, b := range proxy.backends {
+		log.Printf("  [%d] %s", i, b.URL.String())
+	}
+	switch *mode {
+	case "round-robin":
+		log.Printf("Routing: round-robin across healthy backends")
+	case "sticky-rr":
+		log.Printf("Routing: sticky round-robin (new requests round-robin, repeat hashes stick for %s)", *stickyTTL)
+	default:
+		log.Printf("Routing: consistent hash on first+last %d chars of first 4 messages", *prefixLen)
+	}
+	log.Printf("Health checks: every %s via %s", *healthInterval, *healthPath)
+	log.Printf("Max request size: %d MB", *maxRequestSize/(1<<20))
+	if *debug {
+		log.Printf("Debug mode: ENABLED (content previews in logs, stats endpoint, debug response headers)")
+		log.Printf("Stats: http://%s/proxy/stats", *listen)
+	}
 
 	// Start health checker
 	go proxy.startHealthChecker(ctx, *healthInterval)
@@ -1238,26 +1282,6 @@ Examples:
 			log.Printf("[shutdown] Error during shutdown: %v", err)
 		}
 	}()
-
-	log.Printf("llmproxy starting on %s", *listen)
-	log.Printf("Backends:")
-	for i, b := range proxy.backends {
-		log.Printf("  [%d] %s", i, b.URL.String())
-	}
-	switch *mode {
-	case "round-robin":
-		log.Printf("Routing: round-robin across healthy backends")
-	case "sticky-rr":
-		log.Printf("Routing: sticky round-robin (new requests round-robin, repeat hashes stick for %s)", *stickyTTL)
-	default:
-		log.Printf("Routing: consistent hash on first+last %d chars of first 4 messages", *prefixLen)
-	}
-	log.Printf("Health checks: every %s via %s", *healthInterval, *healthPath)
-	log.Printf("Max request size: %d MB", *maxRequestSize/(1<<20))
-	if *debug {
-		log.Printf("Debug mode: ENABLED (content previews in logs, stats endpoint, debug response headers)")
-		log.Printf("Stats: http://%s/proxy/stats", *listen)
-	}
 
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("SERVER_ERROR: %v", err)
