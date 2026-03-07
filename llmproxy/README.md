@@ -53,10 +53,19 @@ Backend hostnames (especially `.local` mDNS names) are resolved at startup using
 ## Build
 
 ```bash
-go build -o llmproxy .
+./build.sh
 ```
 
+Or manually: `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o llmproxy .`
+
 Requires Go 1.21+.
+
+## Docker
+
+```bash
+docker build -t llmproxy .
+docker run -p 7888:7888 llmproxy --listen 0.0.0.0:7888 --backends host1:8000,host2:8000
+```
 
 ## Usage
 
@@ -84,6 +93,8 @@ Requires Go 1.21+.
                          content previews in logs, backend name and raw error in error responses
 --max-request-size N   Maximum request body size in bytes (default: 16777216, 16 MB)
                          Returns HTTP 413 when exceeded
+--rate-limit N         Max requests per second per IP (default: 0 = unlimited)
+                         Token bucket with burst = 2x rate; excess requests receive HTTP 429
 ```
 
 ### Endpoints
@@ -138,7 +149,7 @@ Prefixes: `new:` = first time seen (round-robin assigned), `sticky:` = returning
 - Returning hashes route to the stored backend (TTL refreshed on each hit)
 - Default TTL: 12 hours (configurable via `--sticky-ttl`)
 - Max entries: 1000 (configurable via `--sticky-max`)
-- When at capacity, the least-recently-used entry is evicted
+- When at capacity, the least-recently-used entry is evicted via O(1) LRU eviction (doubly-linked list)
 - Expired entries are cleaned up every 60 seconds
 
 ## Health Checks
@@ -162,6 +173,22 @@ llmproxy is designed for use in trusted local networks alongside llama.cpp. Seve
 **Request size limit**: Incoming request bodies are capped at 16 MB by default (`--max-request-size`). Requests that exceed this limit are rejected with HTTP 413 before any routing or memory allocation occurs.
 
 **Salted hash function**: Session fingerprints use Go's `hash/maphash` with a seed generated randomly at startup (`maphash.MakeSeed()`). This prevents offline precomputation of hash collisions against the sticky routing table. Hash values are not stable across restarts, which is acceptable because the sticky table is in-memory only.
+
+**Per-IP rate limiting**: `--rate-limit N` enforces a maximum of N requests per second per client IP using a token bucket. Burst capacity is 2x the configured rate. Excess requests receive HTTP 429.
+
+**Request body sanitization**: Non-POST requests have their body discarded before proxying. This prevents HTTP request smuggling via body content on methods that should not carry a body.
+
+**Hostname validation**: Backend hostnames are validated against `[a-zA-Z0-9._-]` before any DNS resolution is attempted. Hostnames that fail validation are rejected at startup.
+
+**`getent` path pinning**: The system resolver is invoked as `/usr/bin/getent` with an absolute path. If that binary is not present, the proxy logs a warning and falls back to Go's built-in resolver.
+
+**Security headers**: Every response (proxied or locally generated) includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+
+**O(1) LRU eviction**: The sticky table evicts the least-recently-used entry in O(1) time using a doubly-linked list, preventing memory exhaustion under adversarial hash diversity without requiring a full table scan.
+
+**Slow-loris mitigation**: The HTTP server sets `ReadHeaderTimeout: 10s`. Connections that do not complete their request headers within 10 seconds are closed, preventing slow-loris-style resource exhaustion.
+
+**Unicode-safe log truncation**: Log previews are truncated at rune boundaries, not byte boundaries, so multi-byte UTF-8 sequences are never split in log output.
 
 ## Integration
 

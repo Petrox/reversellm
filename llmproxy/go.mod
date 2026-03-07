@@ -1,3 +1,3 @@
 module strixcontrol/proxy/llmproxy
 
-go 1.24.5
+go 1.24.13

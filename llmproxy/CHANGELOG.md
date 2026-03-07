@@ -22,6 +22,30 @@
 - New `--debug` flag for enabling verbose diagnostics (content previews in logs, stats endpoint, debug response headers, detailed error messages).
 - New `--max-request-size` flag for configuring maximum allowed request body size.
 
+## v0.3.1 (2026-03-07)
+
+### Security
+
+- **ReadHeaderTimeout** (`10s`): Mitigates slow-loris attacks by limiting time for HTTP headers to arrive, independent of the 5-minute body read timeout.
+- **Per-IP rate limiting** (`--rate-limit`, default disabled): Token-bucket rate limiter with configurable requests/second per IP and 2x burst allowance. Returns HTTP 429 when exceeded.
+- **Atomic sticky table operations**: `LookupOrStore` method eliminates the race condition where two concurrent first requests for the same session could be assigned different backends.
+- **Hostname validation**: Backend hostnames validated against `[a-zA-Z0-9._-]` before being passed to system resolver. Rejects hostnames with spaces, semicolons, or other potentially dangerous characters.
+- **Pinned getent path**: `exec.Command` now uses `/usr/bin/getent` instead of PATH-dependent lookup. Logs a warning when getent is unavailable and falls back to Go resolver.
+- **Non-POST body sanitization**: GET/HEAD/DELETE requests have body discarded before proxying to prevent HTTP request smuggling via conflicting Content-Length/Transfer-Encoding.
+- **Security response headers**: All responses include `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+- **O(1) LRU eviction**: Sticky table eviction replaced from O(n) linear scan to O(1) using `container/list` doubly-linked list. Eliminates lock contention under adversarial load.
+- **Unicode-safe truncation**: Log content preview truncation now operates on rune boundaries instead of byte boundaries, preventing invalid UTF-8 in log output.
+
+### Features
+
+- New `--rate-limit` flag for per-IP request rate limiting.
+- `build.sh` script for reproducible, security-hardened builds (`-trimpath -ldflags="-s -w"`).
+- `Dockerfile` for containerized deployment (multi-stage, non-root, Alpine-based).
+
+### Build
+
+- Go version requirement bumped from 1.24.5 to 1.24.13, picking up security patches for `os/exec` and `net/http`.
+
 ## v0.2.1 (2026-03-06)
 
 ### Bug Fixes

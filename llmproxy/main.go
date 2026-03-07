@@ -24,6 +24,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -52,8 +53,8 @@ const (
 	defaultPrefixLen      = 256  // chars from each end of message for fingerprint
 	defaultHealthPath     = "/health"
 	defaultHealthInterval = 10 * time.Second
-	defaultStickyTTL      = 12 * time.Hour   // how long a hash→backend mapping stays active
-	defaultStickyMax      = 1000             // max sticky table entries before evicting oldest
+	defaultStickyTTL      = 12 * time.Hour // how long a hash→backend mapping stays active
+	defaultStickyMax      = 1000           // max sticky table entries before evicting oldest
 )
 
 // ---------------------------------------------------------------------------
@@ -299,12 +300,14 @@ type routingResult struct {
 	detail string // verbose description for log (includes hash + previews)
 }
 
-// truncate returns the first n characters of s, appending "…" if truncated.
+// truncate returns the first n runes of s, appending "…" if truncated.
+// Fix M7: use rune boundaries to avoid breaking multi-byte UTF-8 characters.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(r[:n]) + "…"
 }
 
 func extractRoutingKey(body []byte, fpLen int) routingResult {
@@ -370,6 +373,21 @@ func extractRoutingKey(body []byte, fpLen int) routingResult {
 // Hostname Resolution
 // ---------------------------------------------------------------------------
 
+// isValidHostname returns true if hostname contains only characters valid in a
+// DNS label or dotted-decimal IP: letters, digits, dots, hyphens, underscores.
+// Fix M4: prevents shell-injection / path-traversal via exec.Command args.
+func isValidHostname(hostname string) bool {
+	if hostname == "" {
+		return false
+	}
+	for _, r := range hostname {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // resolveHostname resolves a hostname to an IP address using the system resolver
 // (getent hosts), which follows nsswitch.conf and correctly handles .local mDNS.
 //
@@ -384,9 +402,18 @@ func resolveHostname(hostname string) (string, error) {
 		return hostname, nil
 	}
 
+	// Fix M4: validate hostname before passing to exec.Command
+	if !isValidHostname(hostname) {
+		return "", fmt.Errorf("RESOLVE_ERROR: hostname %q contains invalid characters", hostname)
+	}
+
 	// Try system resolver first (getent hosts follows nsswitch.conf properly)
-	out, err := exec.Command("getent", "hosts", hostname).Output()
-	if err == nil {
+	// Fix M4: use absolute path to avoid PATH hijacking
+	out, err := exec.Command("/usr/bin/getent", "hosts", hostname).Output()
+	if err != nil {
+		// Fix M4: log a warning when getent fails so operators know the fallback is in use
+		log.Printf("[resolve] WARN: getent unavailable for %q, falling back to Go resolver: %v", hostname, err)
+	} else {
 		fields := strings.Fields(strings.TrimSpace(string(out)))
 		if len(fields) >= 1 {
 			ip := fields[0]
@@ -408,17 +435,22 @@ func resolveHostname(hostname string) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Sticky Table (hash → backend with TTL)
+// Sticky Table (hash → backend with TTL, O(1) LRU via container/list)
 // ---------------------------------------------------------------------------
 
+// stickyEntry is stored as the value in the doubly-linked list.
+// Fix L4: lastUsed field removed; list position encodes LRU order.
 type stickyEntry struct {
+	hash        uint32
 	backendName string
 	expiresAt   time.Time
-	lastUsed    time.Time
 }
 
+// StickyTable maps request hashes to backend names with TTL-based expiry and
+// LRU eviction. Fix L4: uses container/list so eviction is O(1) instead of O(n).
 type StickyTable struct {
-	entries map[uint32]stickyEntry
+	entries map[uint32]*list.Element // hash -> list element
+	order   *list.List               // front = oldest (LRU), back = newest (MRU)
 	ttl     time.Duration
 	maxSize int
 	mu      sync.RWMutex
@@ -426,7 +458,8 @@ type StickyTable struct {
 
 func NewStickyTable(ttl time.Duration, maxSize int) *StickyTable {
 	return &StickyTable{
-		entries: make(map[uint32]stickyEntry),
+		entries: make(map[uint32]*list.Element),
+		order:   list.New(),
 		ttl:     ttl,
 		maxSize: maxSize,
 	}
@@ -436,64 +469,105 @@ func NewStickyTable(ttl time.Duration, maxSize int) *StickyTable {
 func (st *StickyTable) Lookup(hash uint32) (string, bool) {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	entry, ok := st.entries[hash]
-	if !ok || time.Now().After(entry.expiresAt) {
+	elem, ok := st.entries[hash]
+	if !ok {
+		return "", false
+	}
+	entry := elem.Value.(stickyEntry)
+	if time.Now().After(entry.expiresAt) {
 		return "", false
 	}
 	return entry.backendName, true
 }
 
 // Store assigns a hash to a backend with the configured TTL.
-// If the table is at capacity, evicts the oldest entry first.
+// If the table is at capacity, evicts the LRU entry first.
 func (st *StickyTable) Store(hash uint32, backendName string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	// Evict oldest if at capacity (and this is a new entry)
-	if _, exists := st.entries[hash]; !exists && len(st.entries) >= st.maxSize {
+	// If hash already exists, remove it from its current list position
+	if elem, exists := st.entries[hash]; exists {
+		st.order.Remove(elem)
+		delete(st.entries, hash)
+	} else if len(st.entries) >= st.maxSize {
+		// New entry and at capacity: evict LRU (front of list)
 		st.evictOldest()
 	}
 
 	now := time.Now()
-	st.entries[hash] = stickyEntry{
+	entry := stickyEntry{
+		hash:        hash,
 		backendName: backendName,
 		expiresAt:   now.Add(st.ttl),
-		lastUsed:    now,
 	}
+	elem := st.order.PushBack(entry)
+	st.entries[hash] = elem
 }
 
-// Touch refreshes the TTL and last-used time for an existing entry.
+// Touch refreshes the TTL and moves the entry to the MRU position.
 func (st *StickyTable) Touch(hash uint32) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if entry, ok := st.entries[hash]; ok {
-		now := time.Now()
-		entry.expiresAt = now.Add(st.ttl)
-		entry.lastUsed = now
-		st.entries[hash] = entry
+	elem, ok := st.entries[hash]
+	if !ok {
+		return
 	}
+	entry := elem.Value.(stickyEntry)
+	entry.expiresAt = time.Now().Add(st.ttl)
+	elem.Value = entry
+	st.order.MoveToBack(elem)
 }
 
-// evictOldest removes the entry with the oldest lastUsed time.
+// LookupOrStore atomically looks up a hash and returns the stored backend if found
+// and not expired. If not found or expired, stores newBackendName and returns it.
+// Returns (backendName, wasExisting).
+// Fix M3: combines Lookup + Touch + Store in a single lock acquisition.
+func (st *StickyTable) LookupOrStore(hash uint32, newBackendName string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	elem, ok := st.entries[hash]
+	if ok {
+		entry := elem.Value.(stickyEntry)
+		if !time.Now().After(entry.expiresAt) {
+			// Found and not expired — touch (refresh TTL and move to MRU)
+			entry.expiresAt = time.Now().Add(st.ttl)
+			elem.Value = entry
+			st.order.MoveToBack(elem)
+			return entry.backendName, true
+		}
+		// Expired: remove the old element before storing new one
+		st.order.Remove(elem)
+		delete(st.entries, hash)
+	}
+
+	// Not found or expired — store new entry
+	if len(st.entries) >= st.maxSize {
+		st.evictOldest()
+	}
+	now := time.Now()
+	entry := stickyEntry{
+		hash:        hash,
+		backendName: newBackendName,
+		expiresAt:   now.Add(st.ttl),
+	}
+	newElem := st.order.PushBack(entry)
+	st.entries[hash] = newElem
+	return newBackendName, false
+}
+
+// evictOldest removes the LRU entry (front of list).
 // Must be called with st.mu held.
 func (st *StickyTable) evictOldest() {
-	var oldestHash uint32
-	var oldestTime time.Time
-	first := true
-
-	for hash, entry := range st.entries {
-		if first || entry.lastUsed.Before(oldestTime) {
-			oldestHash = hash
-			oldestTime = entry.lastUsed
-			first = false
-		}
+	front := st.order.Front()
+	if front == nil {
+		return
 	}
-
-	if !first {
-		log.Printf("[sticky] evicted hash=%08x (last used %s ago, table at %d/%d)",
-			oldestHash, time.Since(oldestTime).Round(time.Second), len(st.entries), st.maxSize)
-		delete(st.entries, oldestHash)
-	}
+	entry := front.Value.(stickyEntry)
+	log.Printf("[sticky] evicted hash=%08x (table at %d/%d)", entry.hash, len(st.entries), st.maxSize)
+	st.order.Remove(front)
+	delete(st.entries, entry.hash)
 }
 
 // Cleanup removes expired entries.
@@ -502,9 +576,13 @@ func (st *StickyTable) Cleanup() {
 	defer st.mu.Unlock()
 	now := time.Now()
 	count := 0
-	for hash, entry := range st.entries {
+	var next *list.Element
+	for elem := st.order.Front(); elem != nil; elem = next {
+		next = elem.Next()
+		entry := elem.Value.(stickyEntry)
 		if now.After(entry.expiresAt) {
-			delete(st.entries, hash)
+			st.order.Remove(elem)
+			delete(st.entries, entry.hash)
 			count++
 		}
 	}
@@ -521,6 +599,84 @@ func (st *StickyTable) Len() int {
 }
 
 // ---------------------------------------------------------------------------
+// Security Headers Middleware
+// ---------------------------------------------------------------------------
+
+// securityHeaders sets defensive HTTP response headers on all responses.
+// Fix L2: mitigates MIME-sniffing attacks and clickjacking via framing.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Per-IP Rate Limiter (token bucket)
+// ---------------------------------------------------------------------------
+
+// ipRateLimiter implements a per-IP token-bucket rate limiter.
+// Fix M2: prevents a single IP from exhausting backend capacity.
+type ipRateLimiter struct {
+	mu       sync.Mutex
+	visitors map[string]*visitor
+	rps      float64
+	burst    int
+}
+
+type visitor struct {
+	tokens   float64
+	lastTime time.Time
+}
+
+func newIPRateLimiter(rps float64, burst int) *ipRateLimiter {
+	rl := &ipRateLimiter{
+		visitors: make(map[string]*visitor),
+		rps:      rps,
+		burst:    burst,
+	}
+	return rl
+}
+
+func (rl *ipRateLimiter) Allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	v, exists := rl.visitors[ip]
+	if !exists {
+		rl.visitors[ip] = &visitor{tokens: float64(rl.burst) - 1, lastTime: now}
+		return true
+	}
+
+	elapsed := now.Sub(v.lastTime).Seconds()
+	v.tokens += elapsed * rl.rps
+	if v.tokens > float64(rl.burst) {
+		v.tokens = float64(rl.burst)
+	}
+	v.lastTime = now
+
+	if v.tokens >= 1 {
+		v.tokens -= 1
+		return true
+	}
+	return false
+}
+
+// cleanup removes visitors that haven't been seen for over a minute.
+func (rl *ipRateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	cutoff := time.Now().Add(-1 * time.Minute)
+	for ip, v := range rl.visitors {
+		if v.lastTime.Before(cutoff) {
+			delete(rl.visitors, ip)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Proxy Server
 // ---------------------------------------------------------------------------
 
@@ -531,9 +687,10 @@ type ProxyServer struct {
 	listen     string
 	prefixLen  int
 	healthPath string
-	mode           string // "hash" or "round-robin"
-	debug          bool   // enable verbose logging, stats endpoint, debug headers
-	maxRequestSize int64  // maximum allowed request body size in bytes
+	mode           string         // "hash" or "round-robin"
+	debug          bool           // enable verbose logging, stats endpoint, debug headers
+	maxRequestSize int64          // maximum allowed request body size in bytes
+	limiter        *ipRateLimiter // nil means unlimited
 
 	totalRequests    atomic.Int64
 	routedRequests   atomic.Int64
@@ -633,8 +790,23 @@ func (ps *ProxyServer) nextRoundRobin() *Backend {
 func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ps.totalRequests.Add(1)
 
+	// Fix M2: enforce per-IP rate limit before any further processing
+	if ps.limiter != nil {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		if !ps.limiter.Allow(ip) {
+			http.Error(w, `{"error":{"message":"rate limit exceeded","type":"proxy_error"}}`, http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	// Non-POST requests: forward to next healthy backend
 	if r.Method != http.MethodPost {
+		// Fix M6: discard any body on non-POST requests to prevent HTTP request smuggling
+		r.Body = http.NoBody
+		r.ContentLength = 0
 		var backend *Backend
 		if ps.mode == "round-robin" {
 			backend = ps.nextRoundRobin()
@@ -679,27 +851,30 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// backend for KV cache reuse. Independent requests (different images,
 		// different hashes each time) get evenly distributed.
 		if rr.key != "" {
-			// Check sticky table: has this hash been seen before?
-			if name, ok := ps.sticky.Lookup(rr.hash); ok {
+			// Fix M3: use LookupOrStore for atomic lookup+touch or store
+			candidate := ps.nextRoundRobin()
+			if candidate != nil {
+				name, wasExisting := ps.sticky.LookupOrStore(rr.hash, candidate.Name)
 				b := ps.findBackend(name)
 				if b != nil && b.IsHealthy() {
 					backend = b
-					ps.sticky.Touch(rr.hash)
 					ps.routedRequests.Add(1)
-					rr.reason = "sticky:" + rr.reason
-					rr.detail = "sticky:" + rr.detail
-				}
-				// If stored backend is unhealthy, fall through to round-robin
-			}
-
-			// Not in sticky table (or stored backend unhealthy): round-robin assign
-			if backend == nil {
-				backend = ps.nextRoundRobin()
-				if backend != nil {
-					ps.sticky.Store(rr.hash, backend.Name)
-					ps.routedRequests.Add(1)
-					rr.reason = "new:" + rr.reason
-					rr.detail = "new:" + rr.detail
+					if wasExisting {
+						rr.reason = "sticky:" + rr.reason
+						rr.detail = "sticky:" + rr.detail
+					} else {
+						rr.reason = "new:" + rr.reason
+						rr.detail = "new:" + rr.detail
+					}
+				} else if wasExisting {
+					// Stored backend is unhealthy, re-assign via round-robin
+					backend = ps.nextRoundRobin()
+					if backend != nil {
+						ps.sticky.Store(rr.hash, backend.Name)
+						ps.routedRequests.Add(1)
+						rr.reason = "reassign:" + rr.reason
+						rr.detail = "reassign:" + rr.detail
+					}
 				}
 			}
 		}
@@ -950,6 +1125,7 @@ func main() {
 	healthInterval := flag.Duration("health-interval", defaultHealthInterval, "Health check interval")
 	debug := flag.Bool("debug", false, "Enable debug mode (verbose logging with content previews, stats endpoint, debug response headers)")
 	maxRequestSize := flag.Int64("max-request-size", 16<<20, "Maximum request body size in bytes (default 16 MB)")
+	rateLimit := flag.Int("rate-limit", 0, "Max requests per second per IP (0 = unlimited)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `llmproxy - KV-cache-aware reverse proxy for llama.cpp
@@ -1011,9 +1187,28 @@ Examples:
 	proxy.debug = *debug
 	proxy.maxRequestSize = *maxRequestSize
 
-	// Start health checker
+	// Fix M2: set up per-IP rate limiter if requested
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	var limiter *ipRateLimiter
+	if *rateLimit > 0 {
+		limiter = newIPRateLimiter(float64(*rateLimit), *rateLimit*2)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(1 * time.Minute):
+					limiter.cleanup()
+				}
+			}
+		}()
+		log.Printf("Rate limit: %d req/s per IP (burst: %d)", *rateLimit, *rateLimit*2)
+	}
+	proxy.limiter = limiter
+
+	// Start health checker
 	go proxy.startHealthChecker(ctx, *healthInterval)
 
 	// Routes
@@ -1022,11 +1217,12 @@ Examples:
 	mux.Handle("/", proxy)
 
 	server := &http.Server{
-		Addr:         *listen,
-		Handler:      mux,
-		ReadTimeout:  5 * time.Minute,  // LLM requests can have large bodies
-		WriteTimeout: 10 * time.Minute, // LLM responses can stream for minutes
-		IdleTimeout:  2 * time.Minute,
+		Addr:              *listen,
+		Handler:           securityHeaders(mux), // Fix L2: wrap mux with security headers middleware
+		ReadHeaderTimeout: 10 * time.Second,     // Fix M1: mitigate slow-loris on header phase
+		ReadTimeout:       5 * time.Minute,      // LLM requests can have large bodies
+		WriteTimeout:      10 * time.Minute,     // LLM responses can stream for minutes
+		IdleTimeout:       2 * time.Minute,
 	}
 
 	// Graceful shutdown
