@@ -1046,11 +1046,85 @@ func TestSkipJSONValue(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dec := newDec(tt.fragment)
-			if err := skipJSONValue(dec); err != nil {
+			if err := skipJSONValue(dec, 0); err != nil {
 				t.Fatalf("skipJSONValue error: %v", err)
 			}
 			readSentinel(t, dec)
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestSkipJSONValueDepthLimit — verifies that deeply nested JSON triggers
+// the depth limit error instead of stack overflow (security review M2 fix).
+// ---------------------------------------------------------------------------
+
+func TestSkipJSONValueDepthLimit(t *testing.T) {
+	// Build JSON with nesting deeper than maxJSONDepth (128).
+	// Each '{' adds one level; we need 130+ levels.
+	depth := maxJSONDepth + 10
+	var sb strings.Builder
+	for i := 0; i < depth; i++ {
+		sb.WriteString(`{"k":`)
+	}
+	sb.WriteString(`"leaf"`)
+	for i := 0; i < depth; i++ {
+		sb.WriteByte('}')
+	}
+
+	dec := json.NewDecoder(strings.NewReader(sb.String()))
+	err := skipJSONValue(dec, 0)
+	if err == nil {
+		t.Fatal("expected depth limit error, got nil")
+	}
+	if !strings.Contains(err.Error(), "maximum depth") {
+		t.Errorf("expected 'maximum depth' in error, got: %v", err)
+	}
+}
+
+// TestSkipJSONValueWithinDepthLimit verifies that JSON at exactly the max
+// depth limit succeeds.
+func TestSkipJSONValueWithinDepthLimit(t *testing.T) {
+	// Build JSON with nesting exactly at maxJSONDepth.
+	// The value at depth=maxJSONDepth is a scalar, so skipJSONValue is called
+	// with depth=maxJSONDepth which must still succeed (> check, not >=).
+	depth := maxJSONDepth
+	var sb strings.Builder
+	for i := 0; i < depth; i++ {
+		sb.WriteString(`{"k":`)
+	}
+	sb.WriteString(`"leaf"`)
+	for i := 0; i < depth; i++ {
+		sb.WriteByte('}')
+	}
+
+	dec := json.NewDecoder(strings.NewReader(sb.String()))
+	err := skipJSONValue(dec, 0)
+	if err != nil {
+		t.Fatalf("expected no error at depth=%d, got: %v", depth, err)
+	}
+}
+
+// TestExtractRoutingKeyDeeplyNestedNonMessages verifies that a request with
+// deeply nested non-messages fields returns a parse error instead of crashing.
+func TestExtractRoutingKeyDeeplyNestedNonMessages(t *testing.T) {
+	// Build a body where a deeply nested field appears before "messages".
+	depth := maxJSONDepth + 10
+	var sb strings.Builder
+	sb.WriteString(`{"deep":`)
+	for i := 0; i < depth; i++ {
+		sb.WriteString(`{"k":`)
+	}
+	sb.WriteString(`"leaf"`)
+	for i := 0; i < depth; i++ {
+		sb.WriteByte('}')
+	}
+	sb.WriteString(`,"messages":[{"role":"user","content":"hello"}]}`)
+
+	got := extractRoutingKey([]byte(sb.String()), 20)
+	// Should get a parse error (from depth limit), not a crash.
+	if got.reason != "json-parse-error" {
+		t.Errorf("reason = %q, want %q", got.reason, "json-parse-error")
 	}
 }
 

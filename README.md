@@ -182,7 +182,7 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 
 **Salted hash function**: Session fingerprints use Go's `hash/maphash` with a seed generated randomly at startup (`maphash.MakeSeed()`). This prevents offline precomputation of hash collisions against the sticky routing table. Hash values are not stable across restarts, which is acceptable because the sticky table is in-memory only.
 
-**Per-IP rate limiting**: `--rate-limit N` enforces a maximum of N requests per second per client IP using a token bucket. Burst capacity is 2x the configured rate. Excess requests receive HTTP 429.
+**Per-IP rate limiting**: `--rate-limit N` enforces a maximum of N requests per second per client IP using a token bucket. Burst capacity is 2x the configured rate. Excess requests receive HTTP 429. **Note**: Rate limiting uses the TCP peer address (`RemoteAddr`), not `X-Forwarded-For`. When running behind another reverse proxy or load balancer, all clients appear to share one IP, making the rate limit apply collectively. This is by design — `X-Forwarded-For` is trivially spoofable by direct clients. If you need per-client rate limiting behind a trusted proxy, implement it at the outer proxy layer instead.
 
 **Request body sanitization**: Non-POST requests have their body discarded before proxying. This prevents HTTP request smuggling via body content on methods that should not carry a body.
 
@@ -190,7 +190,11 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 
 **`getent` path pinning**: The system resolver is invoked as `/usr/bin/getent` with an absolute path. If that binary is not present, the proxy logs a warning and falls back to Go's built-in resolver.
 
+**Proxy forwarding headers**: Proxied requests include `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Via: 1.1 reversellm` headers per RFC 7230 §5.7.1, enabling backends to reconstruct original request context.
+
 **Security headers**: Every response (proxied or locally generated) includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+
+**JSON depth limit**: The JSON parser rejects request bodies with nesting deeper than 128 levels, preventing stack overflow from crafted payloads.
 
 **O(1) LRU eviction**: The sticky table evicts the least-recently-used entry in O(1) time using a doubly-linked list, preventing memory exhaustion under adversarial hash diversity without requiring a full table scan.
 
@@ -206,7 +210,7 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 
 **Stats endpoint localhost restriction**: When `--debug` is enabled, `/proxy/stats` is restricted to localhost (`127.0.0.1` / `::1`). Remote clients receive HTTP 403 even in debug mode.
 
-**Known accepted risks**: No TLS (plaintext HTTP), no authentication. See `reports/security-review-2026-03-08-v2.md` for the latest full review.
+**Known accepted risks**: No TLS (plaintext HTTP), no authentication. See `reports/security-review-2026-03-08-v3.md` for the latest full review.
 
 ## Integration
 

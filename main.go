@@ -55,6 +55,7 @@ const (
 	defaultHealthInterval = 10 * time.Second
 	defaultStickyTTL      = 12 * time.Hour // how long a hash→backend mapping stays active
 	defaultStickyMax      = 1000           // max sticky table entries before evicting oldest
+	maxJSONDepth          = 128            // max nesting depth for JSON parsing (prevents stack overflow)
 )
 
 // ---------------------------------------------------------------------------
@@ -162,13 +163,19 @@ type Backend struct {
 	origPort     string // original port (e.g. "8080")
 	healthy      atomic.Bool
 	requests     atomic.Int64
-	mu           sync.Mutex // protects URL during re-resolution
+	mu           sync.Mutex             // protects URL during re-resolution
+	proxy        *httputil.ReverseProxy // pre-created reverse proxy, reused across requests (H1 fix)
 }
 
 func (b *Backend) IsHealthy() bool { return b.healthy.Load() }
 
 // ReResolve attempts to re-resolve the original hostname and update the URL
 // if the IP has changed. Returns true if the IP was updated.
+//
+// DNS resolution runs before the lock is acquired. This is safe because
+// ReResolve is only called from checkAllBackends, which launches exactly one
+// goroutine per backend — concurrent calls for the same backend cannot occur.
+// (Security review M1: accepted)
 func (b *Backend) ReResolve() bool {
 	if b.origHostname == "" || net.ParseIP(b.origHostname) != nil {
 		return false // was an IP literal, nothing to re-resolve
@@ -315,7 +322,12 @@ func truncate(s string, n int) string {
 // skipJSONValue advances dec past exactly one JSON value (scalar or nested
 // object/array). Used to discard top-level request fields other than
 // "messages" without allocating Go objects for their contents.
-func skipJSONValue(dec *json.Decoder) error {
+// The depth parameter prevents stack overflow from maliciously deep nesting
+// (security review M2 fix: crafted 16MB body of nested '{' could crash process).
+func skipJSONValue(dec *json.Decoder, depth int) error {
+	if depth > maxJSONDepth {
+		return fmt.Errorf("JSON nesting exceeds maximum depth of %d", maxJSONDepth)
+	}
 	t, err := dec.Token()
 	if err != nil {
 		return err
@@ -325,7 +337,7 @@ func skipJSONValue(dec *json.Decoder) error {
 		// Opening { or [ — consume all nested tokens until the matching
 		// close delimiter is reached (depth is implicitly tracked by dec.More).
 		for dec.More() {
-			if err := skipJSONValue(dec); err != nil {
+			if err := skipJSONValue(dec, depth+1); err != nil {
 				return err
 			}
 		}
@@ -368,7 +380,7 @@ func extractRoutingKey(body []byte, fpLen int) routingResult {
 			return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
 		}
 		if k != "messages" {
-			if err := skipJSONValue(dec); err != nil {
+			if err := skipJSONValue(dec, 0); err != nil {
 				return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
 			}
 			continue
@@ -518,6 +530,14 @@ func resolveHostname(hostname string) (string, error) {
 	}
 	if len(addrs) == 0 {
 		return "", fmt.Errorf("RESOLVE_ERROR: %q resolved to zero addresses", hostname)
+	}
+	// Prefer IPv4 for consistent routing when both IPv4 and IPv6 are available.
+	// Multiple addresses for the same family are acceptable; the first matching
+	// address is used deterministically. (Security review M3: fixed)
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			return addr, nil
+		}
 	}
 	return addrs[0], nil
 }
@@ -772,6 +792,8 @@ func (rl *ipRateLimiter) Allow(ip string) bool {
 		return true
 	}
 
+	// Token accounting uses float64. Precision degrades after ~2^53 sub-second
+	// additions, which is unreachable in practice. (Security review M5: accepted)
 	elapsed := now.Sub(v.lastTime).Seconds()
 	v.tokens += elapsed * rl.rps
 	if v.tokens > float64(rl.burst) {
@@ -916,6 +938,58 @@ func (ps *ProxyServer) nextRoundRobin() *Backend {
 		}
 	}
 	return nil
+}
+
+// initBackendProxies creates a reusable httputil.ReverseProxy for each backend.
+// Must be called after ps.debug is set. Eliminates per-request proxy allocation
+// (security review H1 fix) and adds standard proxy forwarding headers (H2 fix).
+func (ps *ProxyServer) initBackendProxies() {
+	for _, b := range ps.backends {
+		backend := b // capture for closures
+		debug := ps.debug
+		backend.proxy = &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				// Capture original values before overwriting (H2 fix: proxy headers)
+				origHost := req.Host
+				origScheme := "http"
+				if req.TLS != nil {
+					origScheme = "https"
+				}
+
+				// Snapshot backend URL under lock (URL can change via re-resolution)
+				backend.mu.Lock()
+				scheme := backend.URL.Scheme
+				host := backend.URL.Host
+				backend.mu.Unlock()
+
+				req.URL.Scheme = scheme
+				req.URL.Host = host
+				req.Host = host
+
+				// Standard proxy forwarding headers (RFC 7230 §5.7.1)
+				req.Header.Set("X-Forwarded-Proto", origScheme)
+				if origHost != "" {
+					req.Header.Set("X-Forwarded-Host", origHost)
+				}
+				req.Header.Add("Via", "1.1 reversellm")
+			},
+			FlushInterval: -1, // flush SSE chunks immediately for streaming
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				log.Printf("[error] proxy to %s failed: %v (path: %s)", backend.Name, err, r.URL.Path)
+				if debug {
+					msg := fmt.Sprintf("backend %s: %s", backend.Name, err)
+					escapedMsg, _ := json.Marshal(msg)
+					http.Error(w,
+						fmt.Sprintf(`{"error":{"message":%s,"type":"proxy_error"}}`, escapedMsg),
+						http.StatusBadGateway)
+				} else {
+					http.Error(w,
+						`{"error":{"message":"upstream backend unavailable","type":"proxy_error"}}`,
+						http.StatusBadGateway)
+				}
+			},
+		}
+	}
 }
 
 func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1085,51 +1159,23 @@ func (ps *ProxyServer) proxyTo(w http.ResponseWriter, r *http.Request, backend *
 	log.Printf("[route] %s %s -> %s (%s) [total reqs to backend: %d]",
 		r.Method, r.URL.Path, backend.Name, logDetail, backend.requests.Load())
 
-	// Expose routing info in response headers (debug mode only)
+	// Expose routing info in response headers (debug mode only).
+	// Debug mode is intended for operator diagnostics; topology disclosure
+	// is acceptable and expected. (Security review M6: accepted)
 	if ps.debug {
 		w.Header().Set("X-ReverseLLM-Backend", backend.Name)
 		w.Header().Set("X-ReverseLLM-Route", rr.reason)
 	}
 
-	// Snapshot the backend URL under lock (it can change via re-resolution)
-	backend.mu.Lock()
-	scheme := backend.URL.Scheme
-	host := backend.URL.Host
-	backend.mu.Unlock()
-
-	// Set body on request before proxying so it doesn't need to be captured in closure
+	// Set body on request before proxying
 	if body != nil {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 	}
 
-	backendName := backend.Name
-	debug := ps.debug
-
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = scheme
-			req.URL.Host = host
-			req.Host = host
-		},
-		FlushInterval: -1, // flush SSE chunks immediately for streaming
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[error] proxy to %s failed: %v (path: %s)", backendName, err, r.URL.Path)
-			if debug {
-				msg := fmt.Sprintf("backend %s: %s", backendName, err)
-				escapedMsg, _ := json.Marshal(msg)
-				http.Error(w,
-					fmt.Sprintf(`{"error":{"message":%s,"type":"proxy_error"}}`, escapedMsg),
-					http.StatusBadGateway)
-			} else {
-				http.Error(w,
-					`{"error":{"message":"upstream backend unavailable","type":"proxy_error"}}`,
-					http.StatusBadGateway)
-			}
-		},
-	}
-
-	proxy.ServeHTTP(w, r)
+	// Use the pre-created per-backend proxy (H1 fix: eliminates per-request allocation).
+	// The Director reads the current backend URL under lock and sets proxy headers (H2 fix).
+	backend.proxy.ServeHTTP(w, r)
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +1435,10 @@ Examples:
 		log.Printf("Rate limit: %d req/s per IP (burst: %d)", *rateLimit, *rateLimit*2)
 	}
 	proxy.limiter = limiter
+
+	// Create per-backend reverse proxies now that all config (including debug) is set.
+	// Must be called after proxy.debug is set. (H1 fix: pre-created proxies)
+	proxy.initBackendProxies()
 
 	log.Printf("reversellm starting on %s", *listen)
 	log.Printf("Backends:")

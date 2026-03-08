@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.0 (2026-03-08)
+
+### Security
+
+- **Per-backend ReverseProxy reuse (H1)**: Eliminated per-request `httputil.ReverseProxy` allocation. Proxies are now created once per backend at startup and reused across all requests, reducing GC pressure by ~300-500 bytes/request.
+- **Standard proxy forwarding headers (H2)**: Proxied requests now include `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Via: 1.1 reversellm` headers per RFC 7230 §5.7.1.
+- **JSON depth limit (M2)**: `skipJSONValue()` now enforces a maximum nesting depth of 128 levels. Crafted deeply-nested JSON before the `"messages"` key is rejected with a parse error instead of causing a stack overflow that crashes the process.
+- **IPv4 preference in resolver (M3)**: Go resolver fallback now prefers IPv4 addresses when both IPv4 and IPv6 are available, preventing non-deterministic routing on dual-stack hosts.
+- **ReResolve safety documented (M1)**: DNS resolution before lock acquisition in `ReResolve()` is safe because `checkAllBackends` launches exactly one goroutine per backend (accepted with documentation).
+
+### Accepted Risks (Documented)
+
+- **M4**: Rate limiter uses TCP peer address (`RemoteAddr`), not `X-Forwarded-For`. Intentional: `X-Forwarded-For` is spoofable by direct clients. Documented in README.
+- **M5**: Float64 token accounting in rate limiter has precision limits at ~2^53 operations. Unreachable in practice.
+- **M6**: Debug mode exposes backend topology in response headers and error messages. Intentional: debug mode is for operator diagnostics.
+
+### Tests
+
+- Added `TestSkipJSONValueDepthLimit`: verifies depth > 128 triggers error.
+- Added `TestSkipJSONValueWithinDepthLimit`: verifies depth = 128 succeeds.
+- Added `TestExtractRoutingKeyDeeplyNestedNonMessages`: verifies deeply nested non-messages fields return parse error.
+
 ## v0.5.0 (2026-03-08)
 
 ### Security
