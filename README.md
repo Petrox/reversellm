@@ -214,18 +214,4 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 
 **Docker build isolation**: A `.dockerignore` file excludes `.git/`, security reports, and build artifacts from the Docker build context, preventing accidental inclusion of sensitive data in image layers. (Security review M3: fixed)
 
-**Known accepted risks**: No TLS (plaintext HTTP), no authentication. See `reports/security-review-2026-03-08-v3.md` for the latest full review.
-
-## Integration
-
-Managed by `launchproxy.sh`:
-```bash
-./launchproxy.sh --engine reversellm start
-./launchproxy.sh status
-./launchproxy.sh stop
-```
-
-Or run standalone:
-```bash
-./reversellm --backends host1.local:8000,host2.local:8000 --listen :9080
-```
+**Known accepted risks**: No TLS (plaintext HTTP), no authentication. See `reports/security-review-2026-03-08-v4.md` for the latest full review.
