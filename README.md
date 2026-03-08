@@ -215,3 +215,93 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 **Docker build isolation**: A `.dockerignore` file excludes `.git/`, security reports, and build artifacts from the Docker build context, preventing accidental inclusion of sensitive data in image layers. (Security review M3: fixed)
 
 **Known accepted risks**: No TLS (plaintext HTTP), no authentication. See `reports/security-review-2026-03-08-v4.md` for the latest full review.
+
+## systemd Installation
+
+reversellm ships a systemd template unit (`reversellm@.service`) that supports running multiple instances with different configurations.
+
+### Install (single instance)
+
+```bash
+# Build
+./build.sh
+
+# Install binary and unit file
+sudo cp reversellm /usr/local/bin/
+sudo cp reversellm@.service /etc/systemd/system/
+
+# Create config directory and default environment file
+sudo mkdir -p /etc/reversellm
+sudo cp reversellm-default.env /etc/reversellm/default.env
+
+# Edit the environment file with your backends
+sudo editor /etc/reversellm/default.env
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now reversellm@default
+```
+
+### Logs
+
+```bash
+journalctl -u reversellm@default -f
+```
+
+### Multiple Instances
+
+The template unit uses the instance name (the part after `@`) to select an environment file from `/etc/reversellm/<instance>.env`. This allows running multiple reversellm processes on different ports with different backends.
+
+**Example**: 3 instances proxying to different backend port groups:
+
+```bash
+# Copy example environment files (edit backends/ports as needed)
+sudo cp examples/port9000.env /etc/reversellm/port9000.env
+sudo cp examples/port9001.env /etc/reversellm/port9001.env
+sudo cp examples/port9002.env /etc/reversellm/port9002.env
+
+# Start all three
+sudo systemctl enable --now reversellm@port9000
+sudo systemctl enable --now reversellm@port9001
+sudo systemctl enable --now reversellm@port9002
+```
+
+Each instance runs independently with its own listen address, backends, and configuration:
+
+| Instance | Listen | Backends | Config |
+|----------|--------|----------|--------|
+| `reversellm@port9000` | `0.0.0.0:9000` | `host1:8000,host2:8000` | `/etc/reversellm/port9000.env` |
+| `reversellm@port9001` | `0.0.0.0:9001` | `host1:8001,host2:8001` | `/etc/reversellm/port9001.env` |
+| `reversellm@port9002` | `0.0.0.0:9002` | `host1:8002,host2:8002` | `/etc/reversellm/port9002.env` |
+
+**Manage all instances at once:**
+
+```bash
+# Status of all instances
+systemctl list-units 'reversellm@*'
+
+# Restart all
+sudo systemctl restart 'reversellm@*'
+
+# Stop all
+sudo systemctl stop 'reversellm@*'
+```
+
+### Environment File Reference
+
+Each `/etc/reversellm/<instance>.env` file contains:
+
+```bash
+LISTEN_ADDR=0.0.0.0:9000                           # Listen address
+BACKENDS=host1.local:8000,host2.local:8000          # Backend addresses
+MODE=sticky-rr                                       # sticky-rr | round-robin | hash
+STICKY_TTL=12h                                       # Hash->backend mapping TTL
+STICKY_MAX=1000                                      # Max sticky table entries
+PREFIX_LENGTH=256                                    # Fingerprint chars per end
+HEALTH_PATH=/health                                  # Health check endpoint
+HEALTH_INTERVAL=10s                                  # Health check interval
+MAX_REQUEST_SIZE=16777216                            # Max body size (16 MB)
+RATE_LIMIT=0                                         # Per-IP rate limit (0=off)
+```
+
+See `reversellm-default.env` for a commented template.

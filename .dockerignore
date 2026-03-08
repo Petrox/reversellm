@@ -9,3 +9,6 @@ reversellm
 *.pid
 *.out
 *.test
+*.service
+*.env
+examples

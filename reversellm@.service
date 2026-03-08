@@ -1,0 +1,64 @@
+# reversellm — systemd template unit for running multiple instances
+#
+# Each instance is identified by the instance name passed after '@'.
+# The instance name is used to select an environment file that provides
+# the command-line arguments.
+#
+# Installation:
+#   sudo cp reversellm@.service /etc/systemd/system/
+#   sudo cp reversellm /usr/local/bin/
+#   sudo mkdir -p /etc/reversellm
+#   sudo cp reversellm-*.env /etc/reversellm/
+#   sudo systemctl daemon-reload
+#
+# Usage (single instance):
+#   sudo systemctl enable --now reversellm@default
+#
+# Usage (multiple instances with different ports/backends):
+#   sudo systemctl enable --now reversellm@port9000
+#   sudo systemctl enable --now reversellm@port9001
+#   sudo systemctl enable --now reversellm@port9002
+#
+# Logs:
+#   journalctl -u reversellm@port9000 -f
+#
+# Environment file location: /etc/reversellm/%i.env
+# See reversellm-default.env for the available variables.
+
+[Unit]
+Description=reversellm KV-cache-aware reverse proxy (%i)
+Documentation=https://github.com/Petrox/reversellm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/reversellm/%i.env
+ExecStart=/usr/local/bin/reversellm \
+    --listen ${LISTEN_ADDR} \
+    --backends ${BACKENDS} \
+    --mode ${MODE} \
+    --sticky-ttl ${STICKY_TTL} \
+    --sticky-max ${STICKY_MAX} \
+    --prefix-length ${PREFIX_LENGTH} \
+    --health-path ${HEALTH_PATH} \
+    --health-interval ${HEALTH_INTERVAL} \
+    --max-request-size ${MAX_REQUEST_SIZE} \
+    --rate-limit ${RATE_LIMIT}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
