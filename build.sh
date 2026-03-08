@@ -26,11 +26,31 @@ if [ "$USE_DOCKER" = true ]; then
         -e GOOS="$GOOS" \
         -e GOARCH="$GOARCH" \
         "$GO_IMAGE" \
-        go build -trimpath -ldflags="-s -w" -o reversellm .
+        sh -c '
+            echo "Running go vet..."
+            go vet ./...
+            echo "Installing govulncheck..."
+            go install golang.org/x/vuln/cmd/govulncheck@latest
+            echo "Running govulncheck..."
+            govulncheck ./...
+            echo "Building reversellm..."
+            go build -trimpath -ldflags="-s -w" -o reversellm .
+        '
 else
+    echo "Running go vet..."
+    go vet ./...
+
     echo "Building reversellm for ${GOOS}/${GOARCH}..."
     CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
         go build -trimpath -ldflags="-s -w" -o reversellm .
+
+    echo "Running govulncheck (binary mode)..."
+    export PATH="${PATH}:$(go env GOPATH 2>/dev/null)/bin"
+    if ! command -v govulncheck &>/dev/null; then
+        echo "  Installing govulncheck..."
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+    fi
+    govulncheck -mode=binary ./reversellm
 fi
 
 echo "Built: reversellm ($(stat -c%s reversellm 2>/dev/null || stat -f%z reversellm) bytes)"

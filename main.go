@@ -49,8 +49,8 @@ import (
 )
 
 const (
-	defaultReplicas       = 150  // virtual nodes per backend for even distribution
-	defaultPrefixLen      = 256  // chars from each end of message for fingerprint
+	defaultReplicas       = 150 // virtual nodes per backend for even distribution
+	defaultPrefixLen      = 256 // chars from each end of message for fingerprint
 	defaultHealthPath     = "/health"
 	defaultHealthInterval = 10 * time.Second
 	defaultStickyTTL      = 12 * time.Hour // how long a hash→backend mapping stays active
@@ -293,6 +293,7 @@ func fingerprint(s string, n int) string {
 // Why not hash the entire message:
 //   - System prompts can be 50K+ chars, expensive to hash on every request
 //   - Only the identity-bearing parts matter for routing
+//
 // routingResult holds the extracted routing key plus metadata for logging.
 type routingResult struct {
 	key    string // full fingerprint key for hashing
@@ -311,20 +312,99 @@ func truncate(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
+// skipJSONValue advances dec past exactly one JSON value (scalar or nested
+// object/array). Used to discard top-level request fields other than
+// "messages" without allocating Go objects for their contents.
+func skipJSONValue(dec *json.Decoder) error {
+	t, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch t.(type) {
+	case json.Delim:
+		// Opening { or [ — consume all nested tokens until the matching
+		// close delimiter is reached (depth is implicitly tracked by dec.More).
+		for dec.More() {
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		// Consume the closing } or ].
+		_, err = dec.Token()
+		return err
+	}
+	// Scalar (string, number, bool, nil) was already consumed by Token().
+	return nil
+}
+
+// extractRoutingKey builds a stable per-session routing key from the request body.
+//
+// Uses json.NewDecoder with token-level streaming so parsing stops as soon as
+// the first system/developer message and the first user message are found.
+// Remaining messages are never decoded, avoiding full-body allocation for
+// large conversations with many messages.
 func extractRoutingKey(body []byte, fpLen int) routingResult {
-	var req chatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+
+	// Expect the top-level JSON value to be an object.
+	tok, err := dec.Token()
+	if err != nil {
+		return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
 	}
 
-	if len(req.Messages) == 0 {
+	// Scan top-level object keys until we find "messages".
+	// All other field values are skipped without allocation.
+	foundMessages := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
+		}
+		k, ok := keyTok.(string)
+		if !ok {
+			return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
+		}
+		if k != "messages" {
+			if err := skipJSONValue(dec); err != nil {
+				return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
+			}
+			continue
+		}
+		foundMessages = true
+		break
+	}
+
+	if !foundMessages {
+		// Top-level object ended without a "messages" key.
 		return routingResult{reason: "no-messages", detail: "no-messages"}
 	}
 
-	// Extract first system/developer message and first user message.
-	// These are stable across the entire conversation lifetime.
+	// The next token must be '[' — the start of the messages array.
+	// "messages" being null or a non-array type is treated as no messages.
+	arrTok, err := dec.Token()
+	if err != nil {
+		return routingResult{reason: "json-parse-error", detail: "json-parse-error"}
+	}
+	if delim, ok := arrTok.(json.Delim); !ok || delim != '[' {
+		return routingResult{reason: "no-messages", detail: "no-messages"}
+	}
+
+	// Stream-parse messages one at a time.
+	// dec.More() returns false when the next token is ']' (end of array).
+	// We stop decoding as soon as both a system/developer message and a user
+	// message are found — the remaining messages in the array are not read.
 	var systemContent, userContent string
-	for _, msg := range req.Messages {
+	msgCount := 0
+	for dec.More() {
+		var msg chatMessage
+		if err := dec.Decode(&msg); err != nil {
+			// Malformed element: stop here, use whatever we have so far.
+			break
+		}
+		msgCount++
 		content := messageContent(msg.Content)
 		if content == "" {
 			continue
@@ -342,6 +422,10 @@ func extractRoutingKey(body []byte, fpLen int) routingResult {
 		if systemContent != "" && userContent != "" {
 			break
 		}
+	}
+
+	if msgCount == 0 {
+		return routingResult{reason: "no-messages", detail: "no-messages"}
 	}
 
 	if systemContent == "" && userContent == "" {
@@ -719,12 +803,12 @@ func (rl *ipRateLimiter) cleanup() {
 // ---------------------------------------------------------------------------
 
 type ProxyServer struct {
-	backends   []*Backend
-	ring       *ConsistentHash
-	sticky     *StickyTable
-	listen     string
-	prefixLen  int
-	healthPath string
+	backends       []*Backend
+	ring           *ConsistentHash
+	sticky         *StickyTable
+	listen         string
+	prefixLen      int
+	healthPath     string
 	mode           string         // "hash" or "round-robin"
 	debug          bool           // enable verbose logging, stats endpoint, debug headers
 	maxRequestSize int64          // maximum allowed request body size in bytes
