@@ -257,8 +257,14 @@ func messageContent(v interface{}) string {
 							}
 						}
 					} else {
-						// URL-referenced image: use the URL as identity
-						parts = append(parts, "[img:"+urlStr+"]")
+						// URL-referenced image: fingerprint the URL to bound
+						// intermediate allocation. (Security review L1: fixed)
+						const n = 64
+						if len(urlStr) <= n*2 {
+							parts = append(parts, "[img:"+urlStr+"]")
+						} else {
+							parts = append(parts, "[img:"+urlStr[:n]+"…"+urlStr[len(urlStr)-n:]+"]")
+						}
 					}
 				}
 			}
@@ -665,26 +671,54 @@ func (st *StickyTable) LookupOrStore(hash uint32, newBackendName string) (string
 	return newBackendName, false
 }
 
-// ReassignIfUnhealthy atomically replaces the backend for a hash if the current
-// backend is deemed unhealthy by the provided callback. Returns the final backend name.
+// ReassignIfUnhealthy replaces the backend for a hash if the current backend
+// is unhealthy. The health check callback runs outside the lock to avoid
+// holding st.mu while calling external code. (Security review L2: fixed)
 func (st *StickyTable) ReassignIfUnhealthy(hash uint32, isHealthy func(string) bool, newBackendName string) string {
+	// Phase 1: read current backend name under lock.
+	st.mu.RLock()
+	elem, ok := st.entries[hash]
+	if !ok {
+		st.mu.RUnlock()
+		return ""
+	}
+	currentName := elem.Value.(stickyEntry).backendName
+	st.mu.RUnlock()
+
+	// Phase 2: evaluate health callback WITHOUT holding any lock.
+	if isHealthy(currentName) {
+		// Healthy — just touch TTL under write lock.
+		st.mu.Lock()
+		elem, ok := st.entries[hash]
+		if ok {
+			entry := elem.Value.(stickyEntry)
+			entry.expiresAt = time.Now().Add(st.ttl)
+			elem.Value = entry
+			st.order.MoveToBack(elem)
+			st.mu.Unlock()
+			return entry.backendName
+		}
+		st.mu.Unlock()
+		return ""
+	}
+
+	// Phase 3: unhealthy — replace under write lock, re-checking in case
+	// another goroutine already reassigned.
 	st.mu.Lock()
 	defer st.mu.Unlock()
-
-	elem, ok := st.entries[hash]
+	elem, ok = st.entries[hash]
 	if !ok {
 		return ""
 	}
 	entry := elem.Value.(stickyEntry)
-	if isHealthy(entry.backendName) {
-		// Another goroutine already reassigned to a healthy backend
+	// Re-check: another goroutine may have already reassigned.
+	if entry.backendName != currentName {
+		// Already changed — touch and return the new value.
 		entry.expiresAt = time.Now().Add(st.ttl)
 		elem.Value = entry
 		st.order.MoveToBack(elem)
 		return entry.backendName
 	}
-
-	// Replace with new backend
 	entry.backendName = newBackendName
 	entry.expiresAt = time.Now().Add(st.ttl)
 	elem.Value = entry
@@ -704,27 +738,39 @@ func (st *StickyTable) evictOldest() {
 	delete(st.entries, entry.hash)
 }
 
-// Cleanup removes expired entries.
+// Cleanup removes expired entries in batches of up to 100, releasing the lock
+// between batches so concurrent requests are not blocked for the entire sweep.
+// (Security review L3: fixed)
 func (st *StickyTable) Cleanup() {
-	st.mu.Lock()
-	now := time.Now()
-	count := 0
-	var next *list.Element
-	for elem := st.order.Front(); elem != nil; elem = next {
-		next = elem.Next()
-		entry := elem.Value.(stickyEntry)
-		if now.After(entry.expiresAt) {
-			st.order.Remove(elem)
-			delete(st.entries, entry.hash)
-			count++
-		} else {
-			break
+	const batchSize = 100
+	total := 0
+	for {
+		st.mu.Lock()
+		now := time.Now()
+		removed := 0
+		var next *list.Element
+		for elem := st.order.Front(); elem != nil && removed < batchSize; elem = next {
+			next = elem.Next()
+			entry := elem.Value.(stickyEntry)
+			if now.After(entry.expiresAt) {
+				st.order.Remove(elem)
+				delete(st.entries, entry.hash)
+				removed++
+			} else {
+				break // entries are ordered by insertion; no more expired
+			}
 		}
-	}
-	remaining := len(st.entries)
-	st.mu.Unlock()
-	if count > 0 {
-		log.Printf("[sticky] cleaned up %d expired entries, %d remaining", count, remaining)
+		remaining := len(st.entries)
+		st.mu.Unlock()
+		total += removed
+		if removed < batchSize {
+			// No more expired entries (or fewer than a full batch).
+			if total > 0 {
+				log.Printf("[sticky] cleaned up %d expired entries, %d remaining", total, remaining)
+			}
+			return
+		}
+		// Yield briefly so request goroutines can acquire the lock.
 	}
 }
 
@@ -1175,6 +1221,8 @@ func (ps *ProxyServer) proxyTo(w http.ResponseWriter, r *http.Request, backend *
 
 	// Use the pre-created per-backend proxy (H1 fix: eliminates per-request allocation).
 	// The Director reads the current backend URL under lock and sets proxy headers (H2 fix).
+	// URL snapshot staleness is eliminated because the Director always reads the
+	// latest URL at call time under lock. (Security review L5: fixed by H1)
 	backend.proxy.ServeHTTP(w, r)
 }
 
@@ -1236,7 +1284,7 @@ func (ps *ProxyServer) checkAllBackends() {
 					resp2, err2 := client.Get(retryURL)
 					if err2 == nil {
 						defer resp2.Body.Close()
-						io.Copy(io.Discard, resp2.Body)
+						io.Copy(io.Discard, io.LimitReader(resp2.Body, 1<<20))
 						if resp2.StatusCode >= 200 && resp2.StatusCode < 400 {
 							b.healthy.Store(true)
 							log.Printf("[health] %s -> HEALTHY after re-resolve (HTTP %d)", b.Name, resp2.StatusCode)
@@ -1246,7 +1294,9 @@ func (ps *ProxyServer) checkAllBackends() {
 				return
 			}
 			defer resp.Body.Close()
-			io.Copy(io.Discard, resp.Body)
+			// Limit health check body read to 1MB to prevent a misbehaving
+			// backend from consuming excessive bandwidth. (Security review L6: fixed)
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 				b.healthy.Store(true)
@@ -1399,6 +1449,11 @@ Examples:
 	}
 	if strings.Contains(*healthPath, "..") {
 		log.Fatalf("INIT_ERROR: --health-path must not contain '..', got %q", *healthPath)
+	}
+
+	// Security review L7: reject non-positive max-request-size at startup.
+	if *maxRequestSize <= 0 {
+		log.Fatalf("INIT_ERROR: --max-request-size must be positive, got %d", *maxRequestSize)
 	}
 
 	backends := strings.Split(*backendsFlag, ",")

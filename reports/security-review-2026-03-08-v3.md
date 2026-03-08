@@ -641,18 +641,18 @@ write_pidfile() {
 | M6 | Debug mode leaks backend topology | main.go:1089-1092, 1119-1123 | Response headers and error messages expose internal hostnames and IPs in debug mode. |
 | M2 | Recursive JSON skip stack overflow | main.go:318-338 | See HIGH findings — conservatively also listed here at original severity. |
 
-### LOW (8)
+### LOW (8) — ALL RESOLVED
 
-| ID | Finding | Location | Description |
-|----|---------|----------|-------------|
-| L1 | Unbounded image URL in messageContent | main.go:253 | URL-referenced images included verbatim before fingerprint truncation. Bounded by MaxBytesReader. |
-| L2 | Callback invoked under StickyTable lock | main.go:659 | `isHealthy` callback runs while holding write lock. Safe today (atomic reads), fragile for future changes. |
-| L3 | Cleanup holds lock for full scan | main.go:688-709 | Burst expiry of all entries holds write lock for entire removal. Microseconds at maxSize=1000. |
-| L4 | Missing defense-in-depth security headers | main.go:724-730 | No CSP, Cache-Control, or Referrer-Policy headers. JSON responses limit browser attack surface. |
-| L5 | Backend URL snapshot staleness | main.go:1095-1098 | URL snapshotted under lock could be stale by time proxy dials. Next request uses updated URL. |
-| L6 | Health check response body unlimited | main.go:1203 | Health check reads entire backend response. Bounded by 5s timeout (~625MB at 1Gbps). |
-| L7 | Negative max-request-size accepted | main.go:1300 | Negative value causes all POST bodies to be rejected. Operator misconfiguration, not attack. |
-| L8 | PID file race in build.sh | build.sh:62-63 | Brief window where PID file has default umask permissions before chmod. |
+| ID | Finding | Location | Status |
+|----|---------|----------|--------|
+| L1 | Unbounded image URL in messageContent | main.go:259-268 | **FIXED**: URL-referenced images now fingerprinted with first/last 64 chars, matching base64 image handling. |
+| L2 | Callback invoked under StickyTable lock | main.go:674-727 | **FIXED**: ReassignIfUnhealthy refactored to read name under RLock, call callback unlocked, re-lock to reassign with TOCTOU re-check. |
+| L3 | Cleanup holds lock for full scan | main.go:741-775 | **FIXED**: Cleanup now removes expired entries in batches of 100, releasing write lock between batches. |
+| L4 | Missing defense-in-depth security headers | main.go:724-730 | **ACCEPTED**: JSON-only responses are never rendered by browsers. Documented in README. |
+| L5 | Backend URL snapshot staleness | main.go:1222-1225 | **FIXED**: Resolved by H1 fix — Director reads URL under lock at call time, eliminating snapshot staleness. |
+| L6 | Health check response body unlimited | main.go:1287,1299 | **FIXED**: Both health check paths now use `io.LimitReader(resp.Body, 1<<20)` (1MB cap). |
+| L7 | Negative max-request-size accepted | main.go:1455 | **FIXED**: Validated `> 0` at startup with `log.Fatalf`. |
+| L8 | PID file race in build.sh | build.sh:64 | **FIXED**: Uses `install -m 600 /dev/null` to create file with correct permissions atomically before writing PID. |
 
 ---
 

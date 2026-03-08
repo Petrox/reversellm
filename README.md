@@ -192,7 +192,7 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 
 **Proxy forwarding headers**: Proxied requests include `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Via: 1.1 reversellm` headers per RFC 7230 §5.7.1, enabling backends to reconstruct original request context.
 
-**Security headers**: Every response (proxied or locally generated) includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+**Security headers**: Every response (proxied or locally generated) includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`. Additional browser-oriented headers (`Content-Security-Policy`, `Cache-Control`, `Referrer-Policy`) are omitted because the proxy returns JSON exclusively, not HTML — browsers do not render the responses, so these headers provide no practical benefit. (Security review L4: accepted)
 
 **JSON depth limit**: The JSON parser rejects request bodies with nesting deeper than 128 levels, preventing stack overflow from crafted payloads.
 

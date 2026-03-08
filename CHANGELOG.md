@@ -16,6 +16,20 @@
 - **M5**: Float64 token accounting in rate limiter has precision limits at ~2^53 operations. Unreachable in practice.
 - **M6**: Debug mode exposes backend topology in response headers and error messages. Intentional: debug mode is for operator diagnostics.
 
+### Low-Severity Fixes
+
+- **L1**: URL-referenced images in `messageContent()` now fingerprinted with first/last 64 chars, bounding intermediate string allocation.
+- **L2**: `ReassignIfUnhealthy()` refactored: health callback runs outside lock with TOCTOU re-check, eliminating risk of future deadlocks.
+- **L3**: `Cleanup()` now removes expired entries in batches of 100, releasing the write lock between batches to avoid blocking request goroutines.
+- **L5**: Backend URL snapshot staleness eliminated — Director reads URL under lock at call time (resolved by H1 fix).
+- **L6**: Health check response bodies capped at 1MB via `io.LimitReader` on both normal and re-resolve retry paths.
+- **L7**: `--max-request-size` validated to be positive at startup; zero or negative values now cause a fatal error.
+- **L8**: PID file in `build.sh` created with `install -m 600` atomically before writing, eliminating permission race.
+
+### Accepted Risks (Documented)
+
+- **L4**: Missing CSP/Cache-Control/Referrer-Policy headers accepted — proxy returns JSON exclusively, never rendered by browsers. Documented in README.
+
 ### Tests
 
 - Added `TestSkipJSONValueDepthLimit`: verifies depth > 128 triggers error.

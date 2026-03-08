@@ -59,6 +59,8 @@ echo "Built: reversellm ($(stat -c%s reversellm 2>/dev/null || stat -f%z reverse
 # Usage: source build.sh && write_pidfile reversellm.pid
 write_pidfile() {
     local pidfile="${1:-reversellm.pid}"
+    # Create file with restricted permissions atomically to avoid a window
+    # where the file exists with default umask. (Security review L8: fixed)
+    install -m 600 /dev/null "$pidfile"
     echo $$ > "$pidfile"
-    chmod 600 "$pidfile"
 }
