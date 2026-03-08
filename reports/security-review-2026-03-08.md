@@ -31,11 +31,20 @@ The codebase is a single-file Go reverse proxy (1266 LOC, zero third-party depen
 - H3 (error info leak) — partially fixed: non-debug path is safe (line 964-966), debug path still leaks (line 960-962)
 - M2 (no rate limiting) — fixed: `--rate-limit` flag and `ipRateLimiter` at lines 618-677
 
-| Severity | Count |
-|----------|-------|
-| HIGH | 5 |
-| MEDIUM | 10 |
-| LOW | 7 |
+| Severity | Count | Fixed | Accepted |
+|----------|-------|-------|----------|
+| HIGH | 5 | 5 (H1-H5) | 0 |
+| MEDIUM | 10 | 7 (M1,M2,M5,M6,M7,M9 + prior batch) | 3 (M3,M4,M8,M10) |
+| LOW | 7 | 4 (L2,L3,L4,L7 + prior L6) | 3 (L1,L5) |
+
+**Resolution status as of 2026-03-08:**
+- All HIGH findings: IMPLEMENTED (two commit batches)
+- M3 (debug log content): ACCEPTED — gated behind --debug flag
+- M4 (stats endpoint): ACCEPTED — gated behind --debug, startup warning documented
+- M8 (Dockerfile tags): ACCEPTED — documented, digest pinning deferred to CI pipeline
+- M10 (json.Unmarshal): ACCEPTED — plan documented in `reports/json-unmarshal-fix-plan.md`
+- L1 (per-request backend name log): ACCEPTED — useful for operations
+- L5 (ConsistentHash dead mutex): ACCEPTED — forward-compatibility for dynamic backends
 
 ---
 

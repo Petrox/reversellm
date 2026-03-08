@@ -561,6 +561,33 @@ func (st *StickyTable) LookupOrStore(hash uint32, newBackendName string) (string
 	return newBackendName, false
 }
 
+// ReassignIfUnhealthy atomically replaces the backend for a hash if the current
+// backend is deemed unhealthy by the provided callback. Returns the final backend name.
+func (st *StickyTable) ReassignIfUnhealthy(hash uint32, isHealthy func(string) bool, newBackendName string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	elem, ok := st.entries[hash]
+	if !ok {
+		return ""
+	}
+	entry := elem.Value.(stickyEntry)
+	if isHealthy(entry.backendName) {
+		// Another goroutine already reassigned to a healthy backend
+		entry.expiresAt = time.Now().Add(st.ttl)
+		elem.Value = entry
+		st.order.MoveToBack(elem)
+		return entry.backendName
+	}
+
+	// Replace with new backend
+	entry.backendName = newBackendName
+	entry.expiresAt = time.Now().Add(st.ttl)
+	elem.Value = entry
+	st.order.MoveToBack(elem)
+	return newBackendName
+}
+
 // evictOldest removes the LRU entry (front of list).
 // Must be called with st.mu held.
 func (st *StickyTable) evictOldest() {
@@ -569,7 +596,6 @@ func (st *StickyTable) evictOldest() {
 		return
 	}
 	entry := front.Value.(stickyEntry)
-	log.Printf("[sticky] evicted hash=%08x (table at %d/%d)", entry.hash, len(st.entries), st.maxSize)
 	st.order.Remove(front)
 	delete(st.entries, entry.hash)
 }
@@ -577,7 +603,6 @@ func (st *StickyTable) evictOldest() {
 // Cleanup removes expired entries.
 func (st *StickyTable) Cleanup() {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	now := time.Now()
 	count := 0
 	var next *list.Element
@@ -588,10 +613,14 @@ func (st *StickyTable) Cleanup() {
 			st.order.Remove(elem)
 			delete(st.entries, entry.hash)
 			count++
+		} else {
+			break
 		}
 	}
+	remaining := len(st.entries)
+	st.mu.Unlock()
 	if count > 0 {
-		log.Printf("[sticky] cleaned up %d expired entries, %d remaining", count, len(st.entries))
+		log.Printf("[sticky] cleaned up %d expired entries, %d remaining", count, remaining)
 	}
 }
 
@@ -841,6 +870,9 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Read body for routing decision (bounded to prevent memory exhaustion)
 	r.Body = http.MaxBytesReader(w, r.Body, ps.maxRequestSize)
+	bodyCtx, bodyCancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer bodyCancel()
+	r = r.WithContext(bodyCtx)
 	body, err := io.ReadAll(r.Body)
 	r.Body.Close()
 	if err != nil {
@@ -885,13 +917,20 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						rr.detail = "new:" + rr.detail
 					}
 				} else if wasExisting {
-					// Stored backend is unhealthy, re-assign via round-robin
-					backend = ps.nextRoundRobin()
-					if backend != nil {
-						ps.sticky.Store(rr.hash, backend.Name)
-						ps.routedRequests.Add(1)
-						rr.reason = "reassign:" + rr.reason
-						rr.detail = "reassign:" + rr.detail
+					// Stored backend is unhealthy, atomically re-assign via round-robin
+					candidate := ps.nextRoundRobin()
+					if candidate != nil {
+						finalName := ps.sticky.ReassignIfUnhealthy(rr.hash, func(name string) bool {
+							b := ps.findBackend(name)
+							return b != nil && b.IsHealthy()
+						}, candidate.Name)
+						b := ps.findBackend(finalName)
+						if b != nil && b.IsHealthy() {
+							backend = b
+							ps.routedRequests.Add(1)
+							rr.reason = "reassign:" + rr.reason
+							rr.detail = "reassign:" + rr.detail
+						}
 					}
 				}
 			}
@@ -961,21 +1000,26 @@ func (ps *ProxyServer) proxyTo(w http.ResponseWriter, r *http.Request, backend *
 	host := backend.URL.Host
 	backend.mu.Unlock()
 
+	// Set body on request before proxying so it doesn't need to be captured in closure
+	if body != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
+
+	backendName := backend.Name
+	debug := ps.debug
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = scheme
 			req.URL.Host = host
 			req.Host = host
-			if body != nil {
-				req.Body = io.NopCloser(bytes.NewReader(body))
-				req.ContentLength = int64(len(body))
-			}
 		},
 		FlushInterval: -1, // flush SSE chunks immediately for streaming
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[error] proxy to %s failed: %v (path: %s)", backend.Name, err, r.URL.Path)
-			if ps.debug {
-				msg := fmt.Sprintf("backend %s: %s", backend.Name, err)
+			log.Printf("[error] proxy to %s failed: %v (path: %s)", backendName, err, r.URL.Path)
+			if debug {
+				msg := fmt.Sprintf("backend %s: %s", backendName, err)
 				escapedMsg, _ := json.Marshal(msg)
 				http.Error(w,
 					fmt.Sprintf(`{"error":{"message":%s,"type":"proxy_error"}}`, escapedMsg),
@@ -1195,6 +1239,13 @@ Examples:
 
 	if *mode != "hash" && *mode != "round-robin" && *mode != "sticky-rr" {
 		log.Fatalf("INIT_ERROR: invalid --mode %q: must be 'sticky-rr', 'hash', or 'round-robin'", *mode)
+	}
+
+	if !strings.HasPrefix(*healthPath, "/") {
+		log.Fatalf("INIT_ERROR: --health-path must start with '/', got %q", *healthPath)
+	}
+	if strings.Contains(*healthPath, "..") {
+		log.Fatalf("INIT_ERROR: --health-path must not contain '..', got %q", *healthPath)
 	}
 
 	backends := strings.Split(*backendsFlag, ",")

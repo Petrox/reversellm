@@ -9,3 +9,11 @@ echo "Building llmproxy for ${GOOS}/${GOARCH}..."
 CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
     go build -trimpath -ldflags="-s -w" -o llmproxy .
 echo "Built: llmproxy ($(stat -c%s llmproxy 2>/dev/null || stat -f%z llmproxy) bytes)"
+
+# Helper: write PID file with secure permissions (chmod 600)
+# Usage: source build.sh && write_pidfile llmproxy.pid
+write_pidfile() {
+    local pidfile="${1:-llmproxy.pid}"
+    echo $$ > "$pidfile"
+    chmod 600 "$pidfile"
+}

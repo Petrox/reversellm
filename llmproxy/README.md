@@ -188,7 +188,15 @@ llmproxy is designed for use in trusted local networks alongside llama.cpp. Seve
 
 **Slow-loris mitigation**: The HTTP server sets `ReadHeaderTimeout: 10s`. Connections that do not complete their request headers within 10 seconds are closed, preventing slow-loris-style resource exhaustion.
 
-**Unicode-safe log truncation**: Log previews are truncated at rune boundaries, not byte boundaries, so multi-byte UTF-8 sequences are never split in log output.
+**Unicode-safe log truncation**: Log previews and fingerprints are truncated at rune boundaries, not byte boundaries, so multi-byte UTF-8 sequences are never split in log output or routing keys.
+
+**Body-read timeout**: POST body reads are capped at 30 seconds independently of the 5-minute server ReadTimeout, mitigating body-phase slow-loris attacks.
+
+**Health check hardening**: Health checks use a persistent `http.Client` with body draining to prevent connection/FD leaks. The `--health-path` flag is validated to start with `/` and reject `..` traversal.
+
+**Rate limiter bounds**: The per-IP visitor map is capped at 10,000 entries to prevent memory exhaustion from IP-cycling attacks.
+
+**Known accepted risks**: No TLS (plaintext HTTP), no authentication, `/proxy/stats` accessible to any client when `--debug` is enabled, Dockerfile uses mutable image tags (pin digests in production CI). See `reports/security-review-2026-03-08.md` for full details.
 
 ## Integration
 

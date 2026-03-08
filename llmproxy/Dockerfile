@@ -37,6 +37,6 @@ USER llmproxy
 EXPOSE 7888
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://localhost:7888/health 2>/dev/null || exit 1
+    CMD wget -qO- --timeout=4 http://localhost:7888/health 2>/dev/null | grep -qc . || exit 1
 
 ENTRYPOINT ["llmproxy"]

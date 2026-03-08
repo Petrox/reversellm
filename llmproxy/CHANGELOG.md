@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.0 (2026-03-08)
+
+### Security
+
+- **Data race fix (H1)**: Startup log block moved before health checker goroutine launch, eliminating a race on `b.URL.String()` vs `ReResolve()`.
+- **UTF-8 fingerprint fix (H2)**: `fingerprint()` now uses rune slicing (matching prior `truncate()` fix), preventing routing key corruption for non-ASCII content.
+- **JSON-escaped debug errors (H3)**: Debug-mode error responses use `json.Marshal` to escape backend names and error strings, preventing malformed JSON.
+- **Health check connection reuse (H4)**: Persistent `http.Client` with body draining prevents TCP connection/FD leaks from health checks.
+- **Rate limiter hardening (H5)**: Visitor map capped at 10,000 entries to prevent memory exhaustion; cleanup goroutine uses `time.NewTicker` instead of leaking `time.After`.
+- **Atomic unhealthy reassignment (M1)**: New `ReassignIfUnhealthy()` method eliminates TOCTOU race when reassigning sticky sessions from unhealthy backends.
+- **Reduced proxy GC pressure (M2)**: `proxyTo()` no longer captures `body []byte` in Director closure, allowing earlier GC of request bodies.
+- **Body-read timeout (M5)**: 30-second context deadline on POST body reads, independent of 5-minute server ReadTimeout, mitigates body-phase slow-loris.
+- **Leading-hyphen hostname rejection (M6)**: `isValidHostname()` rejects hostnames starting with `-` to prevent getent argument injection.
+- **Health-path validation (M7)**: `--health-path` must start with `/` and must not contain `..`, preventing path traversal in health check URLs.
+- **messageContent safety (M9)**: Unknown JSON content types return empty string instead of `fmt.Sprintf("%v")`, preventing CPU/memory bombs on nested objects.
+- **Lock-free logging (L3)**: `evictOldest()` and `Cleanup()` no longer call `log.Printf` while holding the sticky table write lock.
+- **Early-exit cleanup (L4)**: `Cleanup()` breaks on first non-expired entry instead of scanning the full list under lock.
+- **Dockerfile HEALTHCHECK (L2)**: Added wget timeout and response body validation.
+- **PID file helper (L7)**: `build.sh` provides `write_pidfile()` function with `chmod 600`.
+
+### Accepted Risks (Documented)
+
+- **M3**: Prompt content previews in debug-mode logs — gated behind `--debug`.
+- **M4**: Stats endpoint accessible to any client in debug mode — gated behind `--debug`.
+- **M8**: Dockerfile image tags use mutable tags, not SHA256 digests — deferred to CI pipeline.
+- **M10**: `json.Unmarshal` parses full message array — plan in `reports/json-unmarshal-fix-plan.md`.
+- **L1**: Backend names logged per-request — useful for operations.
+- **L5**: ConsistentHash RWMutex permanently uncontested — forward-compatibility for dynamic backends.
+
 ## v0.3.0 (2026-03-07)
 
 ### Breaking Changes
