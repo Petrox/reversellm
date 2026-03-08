@@ -32,7 +32,7 @@ This is the fifth security audit of reversellm, conducted against commit `6d4631
 
 ## HIGH Findings
 
-### H1 — Duplicate `"messages"` JSON Key: Routing/Backend Mismatch
+### H1 — Duplicate `"messages"` JSON Key: Routing/Backend Mismatch — FIXED
 
 **Location:** `main.go:378-396` (extractRoutingKey streaming parser)
 **Confirmed by:** Proof-of-concept Go program demonstrating the discrepancy
@@ -56,11 +56,13 @@ The streaming JSON parser breaks after finding the **first** `"messages"` key (l
 
 **Remediation:** After the `break` at line 395, continue scanning remaining top-level keys. If a second `"messages"` key is found, return `routingResult{reason: "duplicate-messages-key"}` to force fallback routing explicitly.
 
+**Fix applied:** After parsing the first `"messages"` array, the streaming parser now scans remaining top-level keys. If a second `"messages"` key is found, returns `routingResult{reason: "duplicate-messages-key"}` which triggers fallback routing. Tests added: `TestExtractRoutingKeyDuplicateMessagesKey`, `TestExtractRoutingKeySingleMessagesKey`.
+
 ---
 
 ## MEDIUM Findings
 
-### M1 — DoS via Unbounded Non-System/User Message Loop
+### M1 — DoS via Unbounded Non-System/User Message Loop — FIXED
 
 **Location:** `main.go:419-443`
 **Evidence:** Benchmark: 541,200 tool-role messages fit in 16MB body; loop iterates all of them in ~295ms consuming ~27MB heap.
@@ -70,6 +72,8 @@ The loop only breaks when both `systemContent` and `userContent` are found. If a
 10 concurrent such requests consume ~3 seconds of CPU per second, potentially saturating a core.
 
 **Remediation:** Add `if msgCount >= 500 { break }` inside the loop (line ~425). 500 messages is far beyond any legitimate early-message routing need.
+
+**Fix applied:** Added `maxMsgIteration = 500` constant. The message loop breaks when `msgCount > maxMsgIteration`. Tests added: `TestExtractRoutingKeyMessageIterationCap`, `TestExtractRoutingKeyWithinMessageIterationCap`.
 
 ---
 
@@ -143,35 +147,47 @@ The loop only breaks when both `systemContent` and `userContent` are found. If a
 **Location:** `main.go:1046-1048`
 **Evidence:** `"127.0.0.1"` and `"::ffff:127.0.0.1"` hash to different rate-limit buckets, giving 2x effective rate. Only affects dual-stack listen addresses.
 
-### L2 — Health Path Encoded Traversal Bypasses Startup Check
+### L2 — Health Path Encoded Traversal Bypasses Startup Check — FIXED
 
 **Location:** `main.go:1450-1452`
 **Evidence:** `strings.Contains(*healthPath, "..")` doesn't match `/%2e%2e/admin`. Health URL is sent to the same backend (no cross-trust-boundary SSRF).
 
-### L3 — `MaxRequestSize` Accepts MaxInt64 (8 EB)
+**Fix applied:** Health path is now URL-decoded via `url.PathUnescape` before the `..` traversal check, catching `%2e%2e` encoded variants.
+
+### L3 — `MaxRequestSize` Accepts MaxInt64 (8 EB) — FIXED
 
 **Location:** `main.go:1455-1457`
 **Evidence:** Startup check is `> 0`. At 1 Gbps with 30s timeout, ~3.75 GB per connection. Requires operator error.
 
-### L4 — Binary on Disk Not Built via build.sh
+**Fix applied:** `--max-request-size` is now capped at 1 GB (`1 << 30`). Values exceeding this limit cause a fatal startup error.
+
+### L4 — Binary on Disk Not Built via build.sh — FIXED
 
 **Location:** `./reversellm` (6.9MB, with debug_info)
 **Evidence:** `file reversellm` shows `with debug_info, not stripped`. `build.sh` uses `-ldflags="-s -w"`. Binary skipped symbol stripping and govulncheck.
 
-### L5 — Stale Expired Entries in Sticky Table
+**Fix applied:** Binary rebuilt via `build.sh` with `-trimpath -ldflags="-s -w"`. Now 6.7 MB (stripped, statically linked) vs 9.8 MB (with debug_info).
+
+### L5 — Stale Expired Entries in Sticky Table — FIXED
 
 **Location:** `main.go:583-594`
 **Evidence:** `Lookup` returns miss for expired entries but doesn't evict. At `maxSize=1000`, expired entries reduce effective capacity. Self-correcting via `Cleanup()` every minute.
 
-### L6 — Startup Log Reads `b.URL.String()` Without Lock
+**Fix applied:** `Lookup()` now evicts expired entries on miss: releases read lock, acquires write lock, performs TOCTOU re-check, then deletes from both map and list.
+
+### L6 — Startup Log Reads `b.URL.String()` Without Lock — FIXED
 
 **Location:** `main.go:1500-1501`
 **Evidence:** No `b.mu` lock. Currently safe because health checker starts at line 1519 (after log). A refactor moving the goroutine launch earlier would create a data race.
 
-### L7 — No Via Header Loop Detection
+**Fix applied:** Startup log now reads `b.URL.String()` under `b.mu.Lock()`, safe against future refactors that might move health checker launch earlier.
+
+### L7 — No Via Header Loop Detection — FIXED
 
 **Location:** `main.go:1020`
 **Evidence:** `req.Header.Add("Via", "1.1 reversellm")` appends without checking for existing entries. A request traversing this proxy twice accumulates duplicates.
+
+**Fix applied:** Director now checks existing Via header values for "reversellm" before adding. If already present, the duplicate add is skipped.
 
 ### L8 — Docker Images Pinned to Tags Not Digests
 
@@ -242,10 +258,10 @@ All goroutines have proper termination paths. No goroutine leaks.
 ## Prioritized Remediation
 
 ### Must Fix (HIGH):
-1. **H1**: Detect duplicate `"messages"` keys in streaming parser — prevents routing confusion
+1. ~~**H1**: Detect duplicate `"messages"` keys in streaming parser~~ — **FIXED**
 
 ### Should Fix (MEDIUM):
-2. **M1**: Cap message iteration at 500 — prevents CPU DoS
+2. ~~**M1**: Cap message iteration at 500~~ — **FIXED**
 3. ~~**M2**: Add `ResponseHeaderTimeout` to backend transport~~ — **FIXED**
 4. ~~**M3**: Create `.dockerignore`~~ — **FIXED**
 5. ~~**M4**: Strip `X-Forwarded-For` from client~~ — **FIXED**
@@ -255,9 +271,14 @@ All goroutines have proper termination paths. No goroutine leaks.
 
 ### Nice to Have (LOW):
 9. **L1**: Normalize IPv4-mapped IPv6 in rate limiter
-10. **L2**: Decode health path before traversal check
-11. **L6**: Lock `b.URL` read in startup log or document ordering
-12. **M7**: Pin govulncheck version in build.sh
+10. ~~**L2**: Decode health path before traversal check~~ — **FIXED**
+11. ~~**L3**: Cap `--max-request-size` at 1 GB~~ — **FIXED**
+12. ~~**L4**: Rebuild binary via build.sh with `-trimpath -ldflags="-s -w"`~~ — **FIXED**
+13. ~~**L5**: Evict expired entries on miss in `Lookup()`~~ — **FIXED**
+14. ~~**L6**: Lock `b.URL` read in startup log or document ordering~~ — **FIXED**
+15. ~~**L7**: Check existing Via header before adding~~ — **FIXED**
+16. **L8**: Pin Docker image tags to digests
+17. **M7**: Pin govulncheck version in build.sh
 
 ---
 

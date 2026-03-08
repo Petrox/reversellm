@@ -1201,3 +1201,110 @@ func TestExtractRoutingKeyOnlyAssistantMessages(t *testing.T) {
 		t.Errorf("reason = %q, want %q", got.reason, "no-content")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// H1: Duplicate "messages" JSON key detection
+// ---------------------------------------------------------------------------
+
+// TestExtractRoutingKeyDuplicateMessagesKey verifies that a JSON body
+// containing two top-level "messages" keys is rejected with reason
+// "duplicate-messages-key". Go's json.Unmarshal uses last-key-wins semantics,
+// so a second "messages" key would let an attacker swap the content seen by
+// the backend versus what the proxy routed on.
+func TestExtractRoutingKeyDuplicateMessagesKey(t *testing.T) {
+	// json.Marshal cannot produce duplicate keys; use a raw literal instead.
+	body := []byte(`{"messages":[{"role":"user","content":"decoy"}],"messages":[{"role":"user","content":"real"}]}`)
+
+	got := extractRoutingKey(body, 20)
+
+	if got.reason != "duplicate-messages-key" {
+		t.Errorf("reason = %q, want %q", got.reason, "duplicate-messages-key")
+	}
+	if got.key != "" {
+		t.Errorf("key = %q, want empty on duplicate-messages-key path", got.key)
+	}
+}
+
+// TestExtractRoutingKeySingleMessagesKey verifies that normal operation is not
+// affected by the duplicate-key detection: a body with exactly one "messages"
+// key must still produce a valid routing key.
+func TestExtractRoutingKeySingleMessagesKey(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hello"}],"model":"gpt-4"}`)
+
+	got := extractRoutingKey(body, 20)
+
+	if got.reason == "duplicate-messages-key" {
+		t.Errorf("reason = %q, but body has only one messages key", got.reason)
+	}
+	if got.key == "" {
+		t.Errorf("key is empty, want a non-empty routing key for a valid body")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M1: Message iteration cap at maxMsgIteration (500)
+// ---------------------------------------------------------------------------
+
+// buildToolHeavyBody constructs a JSON body with toolCount messages of role
+// "tool" followed by one message of role "user" with content userContent.
+// It returns the raw JSON bytes.
+func buildToolHeavyBody(t *testing.T, toolCount int, userContent string) []byte {
+	t.Helper()
+	msgs := make([]interface{}, 0, toolCount+1)
+	for i := 0; i < toolCount; i++ {
+		msgs = append(msgs, map[string]interface{}{
+			"role":    "tool",
+			"content": fmt.Sprintf("tool result %d", i),
+		})
+	}
+	msgs = append(msgs, map[string]interface{}{
+		"role":    "user",
+		"content": userContent,
+	})
+	return mustMarshal(map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": msgs,
+	})
+}
+
+// TestExtractRoutingKeyMessageIterationCap verifies that the message loop
+// stops after maxMsgIteration (500) messages. A body with 600 "tool" messages
+// followed by a "user" message at position 601 must not produce a routing key:
+// the loop breaks at 500 and never reaches the user message.
+// The expected result is "no-content" (messages array was found and iterated,
+// but no system/user content was seen within the cap).
+func TestExtractRoutingKeyMessageIterationCap(t *testing.T) {
+	const toolCount = 600
+	body := buildToolHeavyBody(t, toolCount, "user message beyond cap")
+
+	got := extractRoutingKey(body, 20)
+
+	if got.reason != "no-content" {
+		t.Errorf("reason = %q, want %q (user message at position %d is beyond the %d-message cap)",
+			got.reason, "no-content", toolCount+1, maxMsgIteration)
+	}
+	if got.key != "" {
+		t.Errorf("key = %q, want empty when user message is beyond the iteration cap", got.key)
+	}
+}
+
+// TestExtractRoutingKeyWithinMessageIterationCap verifies that the message
+// loop finds a "user" message that appears within the first maxMsgIteration
+// (500) messages. A body with 400 "tool" messages followed by one "user"
+// message at position 401 must produce a valid routing key.
+func TestExtractRoutingKeyWithinMessageIterationCap(t *testing.T) {
+	const toolCount = 400
+	const userMsg = "user message within cap"
+	body := buildToolHeavyBody(t, toolCount, userMsg)
+
+	got := extractRoutingKey(body, 20)
+
+	if got.key == "" {
+		t.Errorf("key is empty, want a non-empty routing key: user message at position %d is within the %d-message cap",
+			toolCount+1, maxMsgIteration)
+	}
+	if got.reason == "no-content" || got.reason == "no-messages" {
+		t.Errorf("reason = %q, but user message at position %d should have been found within the cap",
+			got.reason, toolCount+1)
+	}
+}

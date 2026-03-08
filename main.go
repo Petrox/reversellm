@@ -56,6 +56,7 @@ const (
 	defaultStickyTTL      = 12 * time.Hour // how long a hash→backend mapping stays active
 	defaultStickyMax      = 1000           // max sticky table entries before evicting oldest
 	maxJSONDepth          = 128            // max nesting depth for JSON parsing (prevents stack overflow)
+	maxMsgIteration       = 500            // max messages to iterate before giving up (prevents CPU DoS)
 )
 
 // ---------------------------------------------------------------------------
@@ -423,6 +424,11 @@ func extractRoutingKey(body []byte, fpLen int) routingResult {
 			break
 		}
 		msgCount++
+		// Security review M1 fix: cap message iteration to prevent CPU DoS
+		// from payloads with hundreds of thousands of non-routing-role messages.
+		if msgCount > maxMsgIteration {
+			break
+		}
 		content := messageContent(msg.Content)
 		if content == "" {
 			continue
@@ -439,6 +445,39 @@ func extractRoutingKey(body []byte, fpLen int) routingResult {
 		}
 		if systemContent != "" && userContent != "" {
 			break
+		}
+	}
+
+	// Security review H1 fix: skip past the closing ']' of the messages array,
+	// then scan remaining top-level keys for a duplicate "messages" key.
+	// Go's json.Unmarshal uses last-key-wins semantics, so a second "messages"
+	// key would cause the backend to see different content than what we routed on.
+	// Skip remaining elements in the array first.
+	for dec.More() {
+		if err := skipJSONValue(dec, 0); err != nil {
+			break
+		}
+	}
+	// Consume the closing ']' of the messages array.
+	if tok, err := dec.Token(); err == nil {
+		if _, ok := tok.(json.Delim); ok {
+			// Now scan remaining top-level keys for a duplicate "messages".
+			for dec.More() {
+				keyTok, err := dec.Token()
+				if err != nil {
+					break
+				}
+				k, ok := keyTok.(string)
+				if !ok {
+					break
+				}
+				if k == "messages" {
+					return routingResult{reason: "duplicate-messages-key", detail: "duplicate-messages-key"}
+				}
+				if err := skipJSONValue(dec, 0); err != nil {
+					break
+				}
+			}
 		}
 	}
 
@@ -580,18 +619,30 @@ func NewStickyTable(ttl time.Duration, maxSize int) *StickyTable {
 }
 
 // Lookup returns the backend name for a hash if it exists and hasn't expired.
+// Security review L5 fix: evict expired entries on lookup miss to preserve effective table capacity.
 func (st *StickyTable) Lookup(hash uint32) (string, bool) {
 	st.mu.RLock()
-	defer st.mu.RUnlock()
 	elem, ok := st.entries[hash]
 	if !ok {
+		st.mu.RUnlock()
 		return "", false
 	}
 	entry := elem.Value.(stickyEntry)
-	if time.Now().After(entry.expiresAt) {
-		return "", false
+	if !time.Now().After(entry.expiresAt) {
+		st.mu.RUnlock()
+		return entry.backendName, true
 	}
-	return entry.backendName, true
+	// Entry is expired: release read lock, acquire write lock, re-check, then evict.
+	st.mu.RUnlock()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// TOCTOU re-check: another goroutine may have already evicted or refreshed this entry.
+	elem, ok = st.entries[hash]
+	if ok && time.Now().After(elem.Value.(stickyEntry).expiresAt) {
+		st.order.Remove(elem)
+		delete(st.entries, hash)
+	}
+	return "", false
 }
 
 // Store assigns a hash to a backend with the configured TTL.
@@ -1022,7 +1073,19 @@ func (ps *ProxyServer) initBackendProxies() {
 				if origHost != "" {
 					req.Header.Set("X-Forwarded-Host", origHost)
 				}
-				req.Header.Add("Via", "1.1 reversellm")
+				// Security review L7 fix: prevent Via header accumulation on proxy loops.
+				// Check all existing Via header values; if our token is already present,
+				// the request has already passed through this proxy, so skip adding another.
+				viaLoop := false
+				for _, v := range req.Header.Values("Via") {
+					if strings.Contains(v, "reversellm") {
+						viaLoop = true
+						break
+					}
+				}
+				if !viaLoop {
+					req.Header.Add("Via", "1.1 reversellm")
+				}
 			},
 			FlushInterval: -1, // flush SSE chunks immediately for streaming
 			// Security review M2 fix: set explicit transport timeouts to prevent goroutine
@@ -1470,13 +1533,24 @@ Examples:
 	if !strings.HasPrefix(*healthPath, "/") {
 		log.Fatalf("INIT_ERROR: --health-path must start with '/', got %q", *healthPath)
 	}
-	if strings.Contains(*healthPath, "..") {
+	// Security review L2 fix: decode percent-encoded characters before checking
+	// for path traversal, so /%2e%2e/ is caught alongside /..
+	decodedHealthPath, decErr := url.PathUnescape(*healthPath)
+	if decErr != nil {
+		log.Fatalf("INIT_ERROR: --health-path contains invalid percent-encoding: %v", decErr)
+	}
+	if strings.Contains(decodedHealthPath, "..") {
 		log.Fatalf("INIT_ERROR: --health-path must not contain '..', got %q", *healthPath)
 	}
 
 	// Security review L7: reject non-positive max-request-size at startup.
+	// Security review L3: cap at 1 GB to prevent operator error with absurd values.
 	if *maxRequestSize <= 0 {
 		log.Fatalf("INIT_ERROR: --max-request-size must be positive, got %d", *maxRequestSize)
+	}
+	const maxAllowedRequestSize int64 = 1 << 30 // 1 GB
+	if *maxRequestSize > maxAllowedRequestSize {
+		log.Fatalf("INIT_ERROR: --max-request-size exceeds 1 GB limit (%d), got %d", maxAllowedRequestSize, *maxRequestSize)
 	}
 
 	backends := strings.Split(*backendsFlag, ",")
@@ -1520,8 +1594,12 @@ Examples:
 
 	log.Printf("reversellm starting on %s", *listen)
 	log.Printf("Backends:")
+	// Security review L6 fix: read URL under lock for safety against future refactors.
 	for i, b := range proxy.backends {
-		log.Printf("  [%d] %s", i, b.URL.String())
+		b.mu.Lock()
+		urlStr := b.URL.String()
+		b.mu.Unlock()
+		log.Printf("  [%d] %s", i, urlStr)
 	}
 	switch *mode {
 	case "round-robin":

@@ -4,9 +4,23 @@
 
 ### Security (v4 review fixes)
 
+- **Duplicate messages key detection (H1)**: Streaming JSON parser now scans for duplicate `"messages"` keys after parsing the first one. Duplicate keys return `duplicate-messages-key` fallback routing, preventing routing/backend mismatch from last-key-wins semantics.
+- **Message iteration cap (M1)**: Message loop now breaks after 500 messages (`maxMsgIteration`), preventing CPU DoS from payloads with hundreds of thousands of non-routing-role messages.
+- **Health path encoded traversal (L2)**: `--health-path` is now URL-decoded via `url.PathUnescape` before `..` traversal check, catching `%2e%2e` encoded variants.
+- **Max request size upper bound (L3)**: `--max-request-size` capped at 1 GB; values exceeding this cause fatal startup error.
+- **Expired entry eviction on lookup (L5)**: `StickyTable.Lookup()` now evicts expired entries immediately with lock upgrade and TOCTOU re-check, preserving effective table capacity.
+- **Startup log URL locking (L6)**: Startup log reads `b.URL.String()` under `b.mu.Lock()`, safe against future refactors.
+- **Via header loop detection (L7)**: Director checks existing Via headers for `reversellm` before adding, preventing header accumulation on proxy loops.
 - **Backend transport timeouts (M2)**: Each backend proxy now uses a dedicated `http.Transport` with `ResponseHeaderTimeout: 120s`, `DialContext` timeout `10s`, `MaxIdleConnsPerHost: 10`. Prevents goroutine accumulation from slow/unresponsive backends.
 - **Docker build isolation (M3)**: Added `.dockerignore` to exclude `.git/`, security reports, and build artifacts from Docker build context.
 - **X-Forwarded-For stripping (M4)**: Director now strips client-supplied `X-Forwarded-For` before `httputil.ReverseProxy` appends the real TCP peer IP, preventing IP spoofing through the forwarding chain.
+
+### Tests
+
+- Added `TestExtractRoutingKeyDuplicateMessagesKey`: verifies duplicate `"messages"` key returns `duplicate-messages-key` reason.
+- Added `TestExtractRoutingKeySingleMessagesKey`: verifies normal single-key request is not affected.
+- Added `TestExtractRoutingKeyMessageIterationCap`: verifies loop breaks after 500 messages.
+- Added `TestExtractRoutingKeyWithinMessageIterationCap`: verifies messages within cap are processed normally.
 
 ### Accepted Risks (v4 review)
 
