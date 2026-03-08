@@ -190,7 +190,7 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 
 **`getent` path pinning**: The system resolver is invoked as `/usr/bin/getent` with an absolute path. If that binary is not present, the proxy logs a warning and falls back to Go's built-in resolver.
 
-**Proxy forwarding headers**: Proxied requests include `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Via: 1.1 reversellm` headers per RFC 7230 §5.7.1, enabling backends to reconstruct original request context.
+**Proxy forwarding headers**: Proxied requests include `X-Forwarded-Proto`, `X-Forwarded-Host`, and `Via: 1.1 reversellm` headers per RFC 7230 §5.7.1, enabling backends to reconstruct original request context. Client-supplied `X-Forwarded-For` headers are stripped before the proxy appends the real TCP peer IP, preventing IP spoofing through the forwarding chain. (Security review M4: fixed)
 
 **Security headers**: Every response (proxied or locally generated) includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`. Additional browser-oriented headers (`Content-Security-Policy`, `Cache-Control`, `Referrer-Policy`) are omitted because the proxy returns JSON exclusively, not HTML — browsers do not render the responses, so these headers provide no practical benefit. (Security review L4: accepted)
 
@@ -209,6 +209,10 @@ reversellm is designed for use in trusted local networks alongside llama.cpp. Se
 **Rate limiter bounds**: The per-IP visitor map is capped at 10,000 entries to prevent memory exhaustion from IP-cycling attacks.
 
 **Stats endpoint localhost restriction**: When `--debug` is enabled, `/proxy/stats` is restricted to localhost (`127.0.0.1` / `::1`). Remote clients receive HTTP 403 even in debug mode.
+
+**Backend transport timeouts**: Each backend uses a dedicated `http.Transport` with `ResponseHeaderTimeout: 120s`, `DialContext` timeout `10s`, and `MaxIdleConnsPerHost: 10`. This prevents goroutine accumulation from slow or unresponsive backends. (Security review M2: fixed)
+
+**Docker build isolation**: A `.dockerignore` file excludes `.git/`, security reports, and build artifacts from the Docker build context, preventing accidental inclusion of sensitive data in image layers. (Security review M3: fixed)
 
 **Known accepted risks**: No TLS (plaintext HTTP), no authentication. See `reports/security-review-2026-03-08-v3.md` for the latest full review.
 

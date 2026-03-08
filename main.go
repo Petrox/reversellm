@@ -1012,6 +1012,11 @@ func (ps *ProxyServer) initBackendProxies() {
 				req.URL.Host = host
 				req.Host = host
 
+				// Security review M4 fix: strip client-supplied X-Forwarded-For
+				// so httputil.ReverseProxy appends only the real TCP peer IP.
+				// reversellm is the edge proxy; client-supplied XFF is untrusted.
+				req.Header.Del("X-Forwarded-For")
+
 				// Standard proxy forwarding headers (RFC 7230 §5.7.1)
 				req.Header.Set("X-Forwarded-Proto", origScheme)
 				if origHost != "" {
@@ -1020,6 +1025,22 @@ func (ps *ProxyServer) initBackendProxies() {
 				req.Header.Add("Via", "1.1 reversellm")
 			},
 			FlushInterval: -1, // flush SSE chunks immediately for streaming
+			// Security review M2 fix: set explicit transport timeouts to prevent goroutine
+			// accumulation when a backend accepts connections but never sends response headers.
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ResponseHeaderTimeout: 120 * time.Second,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+			},
+			// Security review M5: Upgrade header passthrough is accepted — reversellm
+			// is a transparent proxy and backends are operator-controlled.
+			// Security review M6: debug error responses may expose internal IPs — accepted;
+			// --debug is for operator diagnostics, not production/multi-tenant use.
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				log.Printf("[error] proxy to %s failed: %v (path: %s)", backend.Name, err, r.URL.Path)
 				if debug {
@@ -1198,6 +1219,8 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (ps *ProxyServer) proxyTo(w http.ResponseWriter, r *http.Request, backend *Backend, body []byte, rr routingResult) {
 	backend.requests.Add(1)
 
+	// Security review M8: debug detail includes 60-char content previews which may
+	// contain sensitive data. Accepted — --debug is operator-only diagnostics.
 	logDetail := rr.reason
 	if ps.debug {
 		logDetail = rr.detail

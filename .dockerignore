@@ -1,0 +1,11 @@
+# Security review M3 fix: prevent sensitive files from being sent to Docker daemon
+.git
+.claude
+reports
+*.md
+!go.mod
+reversellm
+*.log
+*.pid
+*.out
+*.test

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.7.0 (2026-03-08)
+
+### Security (v4 review fixes)
+
+- **Backend transport timeouts (M2)**: Each backend proxy now uses a dedicated `http.Transport` with `ResponseHeaderTimeout: 120s`, `DialContext` timeout `10s`, `MaxIdleConnsPerHost: 10`. Prevents goroutine accumulation from slow/unresponsive backends.
+- **Docker build isolation (M3)**: Added `.dockerignore` to exclude `.git/`, security reports, and build artifacts from Docker build context.
+- **X-Forwarded-For stripping (M4)**: Director now strips client-supplied `X-Forwarded-For` before `httputil.ReverseProxy` appends the real TCP peer IP, preventing IP spoofing through the forwarding chain.
+
+### Accepted Risks (v4 review)
+
+- **M5**: WebSocket `Upgrade` header passthrough accepted — reversellm is a transparent proxy with operator-controlled backends.
+- **M6**: Debug error responses may expose internal IPs — accepted; `--debug` is operator-only diagnostics.
+- **M8**: Debug mode logs 60-char content previews — accepted; explicit purpose of debug mode.
+
 ## v0.6.0 (2026-03-08)
 
 ### Security
