@@ -31,7 +31,8 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# llmproxy runtime files
-llmproxy/llmproxy
-llmproxy/llmproxy.pid
-llmproxy/*.log
+# reversellm runtime files
+/reversellm
+reversellm.pid
+*.log
+!CHANGELOG.md

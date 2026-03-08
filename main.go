@@ -1,4 +1,4 @@
-// llmproxy - KV-cache-aware reverse proxy for llama.cpp
+// reversellm - KV-cache-aware reverse proxy for llama.cpp
 //
 // Routes OpenAI-compatible API requests to backends using consistent hashing
 // on the system prompt content, ensuring requests with the same context
@@ -868,12 +868,20 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read body for routing decision (bounded to prevent memory exhaustion)
+	// Save the original context before applying the body-read timeout.
+	// The 30-second deadline must NOT leak into the proxy round-trip: LLM
+	// streaming responses routinely run for minutes, and passing a timed-out
+	// context to httputil.ReverseProxy would kill them at 30 seconds.
+	origCtx := r.Context()
+
+	// Read body with a 30-second timeout to mitigate body-phase slow-loris.
+	// bodyCancel() is called eagerly (not via defer) immediately after the read
+	// so the deadline is fully released before the proxy path begins.
 	r.Body = http.MaxBytesReader(w, r.Body, ps.maxRequestSize)
-	bodyCtx, bodyCancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer bodyCancel()
+	bodyCtx, bodyCancel := context.WithTimeout(origCtx, 30*time.Second)
 	r = r.WithContext(bodyCtx)
 	body, err := io.ReadAll(r.Body)
+	bodyCancel() // release body-read deadline immediately; must not defer
 	r.Body.Close()
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
@@ -888,6 +896,11 @@ func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	// Restore original context (no body-read deadline) so the proxy
+	// round-trip is bounded only by the server's WriteTimeout, not the
+	// 30-second body-phase limit.
+	r = r.WithContext(origCtx)
 
 	// Extract routing info (fingerprint + hash for logging)
 	rr := extractRoutingKey(body, ps.prefixLen)
@@ -990,8 +1003,8 @@ func (ps *ProxyServer) proxyTo(w http.ResponseWriter, r *http.Request, backend *
 
 	// Expose routing info in response headers (debug mode only)
 	if ps.debug {
-		w.Header().Set("X-LLMProxy-Backend", backend.Name)
-		w.Header().Set("X-LLMProxy-Route", rr.reason)
+		w.Header().Set("X-ReverseLLM-Backend", backend.Name)
+		w.Header().Set("X-ReverseLLM-Route", rr.reason)
 	}
 
 	// Snapshot the backend URL under lock (it can change via re-resolution)
@@ -1132,6 +1145,16 @@ func (ps *ProxyServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fix H4: restrict stats endpoint to localhost even in debug mode
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if host != "127.0.0.1" && host != "::1" {
+		http.Error(w, `{"error":{"message":"stats endpoint restricted to localhost","type":"proxy_error"}}`, http.StatusForbidden)
+		return
+	}
+
 	type backendStat struct {
 		Name     string `json:"name"`
 		URL      string `json:"url"`
@@ -1194,13 +1217,13 @@ func main() {
 	rateLimit := flag.Int("rate-limit", 0, "Max requests per second per IP (0 = unlimited)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `llmproxy - KV-cache-aware reverse proxy for llama.cpp
+		fmt.Fprintf(os.Stderr, `reversellm - KV-cache-aware reverse proxy for llama.cpp
 
 Routes OpenAI-compatible API requests using consistent hashing on the system
 prompt content. Same agent context -> same backend -> maximum KV cache reuse.
 
 Usage:
-  llmproxy --backends host1:8000,host2:8000 [options]
+  reversellm --backends host1:8000,host2:8000 [options]
 
 Options:
 `)
@@ -1224,9 +1247,9 @@ Endpoints:
   /*              All other requests proxied to backends
 
 Examples:
-  llmproxy --backends 192.168.1.100:8000,192.168.1.101:8000
-  llmproxy --listen :7888 --backends host1:8000,host2:8000
-  llmproxy --backends host1:8000,host2:8000 --prefix-length 4096
+  reversellm --backends 192.168.1.100:8000,192.168.1.101:8000
+  reversellm --listen :7888 --backends host1:8000,host2:8000
+  reversellm --backends host1:8000,host2:8000 --prefix-length 4096
 `)
 	}
 
@@ -1283,7 +1306,7 @@ Examples:
 	}
 	proxy.limiter = limiter
 
-	log.Printf("llmproxy starting on %s", *listen)
+	log.Printf("reversellm starting on %s", *listen)
 	log.Printf("Backends:")
 	for i, b := range proxy.backends {
 		log.Printf("  [%d] %s", i, b.URL.String())
@@ -1337,5 +1360,5 @@ Examples:
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("SERVER_ERROR: %v", err)
 	}
-	log.Println("llmproxy stopped")
+	log.Println("reversellm stopped")
 }

@@ -1,7 +1,7 @@
 # M10: json.Unmarshal Full Array Parse — Fix Plan
 
 **Status:** Accepted for now (2026-03-08)
-**Location:** `llmproxy/main.go` `extractRoutingKey()` lines 313-317
+**Location:** `main.go` `extractRoutingKey()` lines 313-317
 
 ## Problem
 

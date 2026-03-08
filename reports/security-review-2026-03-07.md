@@ -1,7 +1,7 @@
-# Security Review: llmproxy
+# Security Review: reversellm
 
 **Date:** 2026-03-07
-**Scope:** Full security review of `/home/petros/proj/reversellm/llmproxy/main.go` (1028 lines, Go 1.24.5, stdlib-only)
+**Scope:** Full security review of `/home/petros/proj/reversellm/main.go` (1028 lines, Go 1.24.5, stdlib-only)
 **Reviewer:** Automated multi-agent security review (4 parallel analyzers: source code vulnerabilities, race conditions, supply chain, configuration/deployment)
 **Verified against:** Actual source code, git status, live log files, compiled binary on disk
 
@@ -68,7 +68,7 @@ detailParts = append(detailParts, fmt.Sprintf("sys:%d(%q)", len(systemContent), 
 detailParts = append(detailParts, fmt.Sprintf("usr:%d(%q)", len(userContent), truncate(userContent, 60)))
 ```
 
-**Evidence:** The first 60 characters of both the system prompt and first user message are written to every route log line. Confirmed in the live log file `/home/petros/proj/reversellm/llmproxy/llmproxy-9080.log`:
+**Evidence:** The first 60 characters of both the system prompt and first user message are written to every route log line. Confirmed in the live log file `/home/petros/proj/reversellm/reversellm-9080.log`:
 
 ```
 [route] POST /v1/chat/completions -> dsstrix1.local:8080 (new:hash=93453ae7
@@ -129,8 +129,8 @@ func (ps *ProxyServer) handleStats(w http.ResponseWriter, r *http.Request) {
 **Location:** `main.go:738-739`
 
 ```go
-w.Header().Set("X-LLMProxy-Backend", backend.Name)
-w.Header().Set("X-LLMProxy-Route", rr.reason)
+w.Header().Set("X-ReverseLLM-Backend", backend.Name)
+w.Header().Set("X-ReverseLLM-Route", rr.reason)
 ```
 
 **Evidence:** Every proxied response includes the backend hostname:port in a response header. An attacker can enumerate all backends by making requests that hit different hash ring positions.
@@ -181,7 +181,7 @@ http.Error(w, fmt.Sprintf(`{"error":{"message":"failed to read request body: %s"
 listen := flag.String("listen", ":7888", "Listen address (host:port)")
 ```
 
-**Evidence:** Default `:7888` is equivalent to `0.0.0.0:7888`. Confirmed by live log: `llmproxy starting on 0.0.0.0:9000`. Since all clients (Cline, Claude Code, Goose) run on localhost, the proxy is exposed to the entire LAN by default when only localhost access is needed.
+**Evidence:** Default `:7888` is equivalent to `0.0.0.0:7888`. Confirmed by live log: `reversellm starting on 0.0.0.0:9000`. Since all clients (Cline, Claude Code, Goose) run on localhost, the proxy is exposed to the entire LAN by default when only localhost access is needed.
 
 **Impact:** Any device on the LAN segment (including IoT, guest WiFi, compromised devices) can access the proxy, use GPU inference time, and enumerate the infrastructure.
 
@@ -224,20 +224,20 @@ func fnvHash(key string) uint32 {
 **Confidence:** 90%
 **Location:** `.gitignore:35-38`
 
-**Evidence:** The `.gitignore` covers `llmproxy/llmproxy.log` but not the port-specific variants. Five unignored log files are present:
-- `llmproxy/llmproxy-10080.log` (1,063 bytes)
-- `llmproxy/llmproxy-9080.log` (440,401 bytes)
-- `llmproxy/llmproxy-9000.log` (31,999 bytes)
-- `llmproxy/llmproxy-9001.log` (8,094 bytes)
-- `llmproxy/llmproxy-9002.log` (31,999 bytes)
+**Evidence:** The `.gitignore` covers `reversellm.log` but not the port-specific variants. Five unignored log files are present:
+- `reversellm-10080.log` (1,063 bytes)
+- `reversellm-9080.log` (440,401 bytes)
+- `reversellm-9000.log` (31,999 bytes)
+- `reversellm-9001.log` (8,094 bytes)
+- `reversellm-9002.log` (31,999 bytes)
 
-These contain resolved internal IPs, backend hostnames, and prompt content previews. While currently NOT tracked by git (the entire `llmproxy/` directory is `??` untracked), a `git add .` or `git add llmproxy/` would commit them.
+These contain resolved internal IPs, backend hostnames, and prompt content previews. While currently NOT tracked by git (shown as `??` untracked), a `git add .` would commit them.
 
 **Impact:** Accidental commit exposes internal infrastructure and prompt data in version history.
 
 **Remediation:** Replace the single-file entry with a glob:
 ```
-llmproxy/*.log
+*.log
 ```
 
 ---
@@ -415,7 +415,7 @@ func truncate(s string, n int) string {
 
 **Severity:** LOW
 **Confidence:** 100%
-**Location:** `llmproxy/llmproxy` (on-disk binary)
+**Location:** `reversellm` (on-disk binary)
 
 **Evidence:** `file` command output: `ELF 64-bit LSB executable, x86-64, dynamically linked, with debug_info, not stripped`. Debug symbols expose internal function names, types, and source file paths, aiding reverse engineering.
 
@@ -439,7 +439,7 @@ func truncate(s string, n int) string {
 
 **Severity:** LOW
 **Confidence:** 80%
-**Location:** `llmproxy/llmproxy.pid` (runtime file)
+**Location:** `reversellm.pid` (runtime file)
 
 **Evidence:** Permissions `664 petros:petros`, content: PID `2421237`. A world-readable PID file on a multi-user system allows reading `/proc/<pid>/cmdline` to see `--backends` flag values, exposing backend addresses.
 
@@ -471,7 +471,7 @@ All 20 imports are Go stdlib. The entire third-party supply chain attack surface
 ### I2. Binary and Logs Not Git-Tracked (Positive)
 
 **Confidence:** 100%
-**Evidence:** `git ls-files llmproxy/llmproxy llmproxy/*.log` returns empty. The entire `llmproxy/` directory shows as `??` (untracked) in `git status`. The `.gitignore` entries are correctly preventing tracking.
+**Evidence:** `git ls-files reversellm *.log` returns empty. The `.gitignore` entries are correctly preventing tracking.
 
 ### I3. Health-to-Proxy TOCTOU Is Correctly Handled
 
@@ -498,7 +498,7 @@ A backend can go unhealthy between health check at line 667 and proxy dispatch a
 | Binary provenance | **Unverifiable** | No Makefile, Dockerfile, or build script. Binary on disk cannot be verified against source. Binary contains debug info (not stripped). |
 | `getent` dependency | **Uncontrolled** | System binary resolved via `$PATH`. No path pinning, no availability check. |
 | go.sum | **N/A** | Correctly absent (no external deps to checksum). |
-| .gitignore coverage | **Partial gap** | `llmproxy/llmproxy.log` covered; `llmproxy/llmproxy-*.log` NOT covered. |
+| .gitignore coverage | **Partial gap** | `reversellm.log` covered; `reversellm-*.log` NOT covered. |
 
 ---
 
@@ -523,7 +523,7 @@ Ordered by impact-to-effort ratio (highest first):
 | Priority | Finding | Effort | Impact |
 |----------|---------|--------|--------|
 | 1 | **C1** — Add `MaxBytesReader` at line 645 | 1 line | Prevents OOM crash |
-| 2 | **H6** — Add `llmproxy/*.log` to `.gitignore` | 1 line | Prevents accidental data leak |
+| 2 | **H6** — Add `*.log` to `.gitignore` | 1 line | Prevents accidental data leak |
 | 3 | **H3** — Remove internal details from error response | 2 lines | Stops IP leakage |
 | 4 | **C2** — Remove content preview from logs | 2 lines | Stops prompt leakage |
 | 5 | **H1** — Restrict stats to loopback | 5 lines | Stops topology enumeration |

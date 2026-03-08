@@ -1,8 +1,8 @@
-# Security Review: llmproxy (Full Method-by-Method Audit)
+# Security Review: reversellm (Full Method-by-Method Audit)
 
 **Date:** 2026-03-08
 **Scope:** Comprehensive security review of all code in `/home/petros/proj/reversellm/`
-**Files reviewed:** `llmproxy/main.go` (1266 lines), `llmproxy/Dockerfile`, `llmproxy/build.sh`, `llmproxy/go.mod`, `.gitignore`
+**Files reviewed:** `main.go` (1266 lines), `Dockerfile`, `build.sh`, `go.mod`, `.gitignore`
 **Methodology:** 4 parallel specialized security agents (concurrency, DoS/resource, injection/validation, config/deployment) + manual cross-referencing
 **Prior review:** `reports/security-review-2026-03-07.md` — fixes verified against current code
 **Known accepted risks:** No HTTPS (M5 from prior), no authentication
@@ -17,7 +17,7 @@ The codebase is a single-file Go reverse proxy (1266 LOC, zero third-party depen
 - C1 (unbounded body read) — fixed via `MaxBytesReader` at line 825
 - H4 (default listen all interfaces) — fixed, now `127.0.0.1:7888` at line 1118
 - H5 (unsalted FNV hash) — fixed, `maphash` with random seed at line 80
-- H6 (log gitignore) — fixed, `llmproxy/*.log` pattern at `.gitignore:37`
+- H6 (log gitignore) — fixed, `*.log` pattern at `.gitignore:37`
 - M1 (no ReadHeaderTimeout) — fixed, 10s at line 1222
 - M3 (sticky Lookup+Store race) — fixed via `LookupOrStore` at line 526
 - M4 (getent path/validation) — fixed with `/usr/bin/getent` and `isValidHostname` at lines 406-412
@@ -252,7 +252,7 @@ Or add a separate `--log-content-previews` flag.
 **Confidence:** 95%
 **Location:** `main.go:1063-1111`
 
-**Evidence:** `/proxy/stats` is gated behind `--debug` (line 1064), but when debug is enabled, it returns resolved backend IPs (e.g., `http://192.168.1.126:8000`) to any HTTP client that can reach the proxy. There is no IP allowlist. Since the proxy has been run bound to `0.0.0.0` (evidenced by log files: `llmproxy starting on 0.0.0.0:9000`), any LAN device can enumerate the full backend topology.
+**Evidence:** `/proxy/stats` is gated behind `--debug` (line 1064), but when debug is enabled, it returns resolved backend IPs (e.g., `http://192.168.1.126:8000`) to any HTTP client that can reach the proxy. There is no IP allowlist. Since the proxy has been run bound to `0.0.0.0` (evidenced by log files: `reversellm starting on 0.0.0.0:9000`), any LAN device can enumerate the full backend topology.
 
 **Remediation:** Add localhost-only restriction:
 ```go
@@ -455,7 +455,7 @@ BusyBox `wget -qO-` exits 0 as long as a TCP connection succeeds and the server 
 
 **Severity:** LOW
 **Confidence:** 80%
-**Location:** `llmproxy/llmproxy.pid` (runtime), `build.sh:5`
+**Location:** `reversellm.pid` (runtime), `build.sh:5`
 
 **Evidence:** `build.sh` line 5 comments `PID files created by launch scripts should use chmod 600`, but this is not enforced in code. The PID file on disk has permissions `664` (world-readable). A world-readable PID file on a multi-user system allows reading `/proc/<pid>/cmdline` to see `--backends` flag values.
 
@@ -489,7 +489,7 @@ BusyBox `wget -qO-` exits 0 as long as a TCP connection succeeds and the server 
 | Docker image pins | **Mutable** | No SHA256 digest pinning on either `FROM` line |
 | Binary provenance | **Good** | `build.sh` and `Dockerfile` use `-trimpath -ldflags="-s -w"` |
 | `getent` dependency | **Hardened** | Absolute path `/usr/bin/getent`, hostname validated (M6 residual: leading hyphen) |
-| `.gitignore` coverage | **Adequate** | `llmproxy/*.log`, `llmproxy/llmproxy.pid`, `llmproxy/llmproxy` all covered |
+| `.gitignore` coverage | **Adequate** | `*.log`, `reversellm.pid`, `reversellm` all covered |
 
 ---
 

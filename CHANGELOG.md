@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.0 (2026-03-08)
+
+### Security
+
+- **Go 1.26.1 upgrade (H1/H2)**: Upgraded from Go 1.24.13 to 1.26.1, resolving 4 stdlib CVEs: GO-2026-4601 (net/url IPv6 parsing), GO-2026-4600 (crypto/x509 panic on malformed certs), GO-2026-4599 (crypto/x509 email constraints), GO-2026-4602 (os.Root FileInfo escape). `govulncheck` now reports 0 vulnerabilities.
+- **Body-read timeout fix (M2)**: The 30-second body-read timeout context no longer leaks into the proxy round-trip. Previously, streaming LLM responses longer than 30 seconds would be killed. The timeout now applies only to `io.ReadAll` and is cancelled immediately after, with the original context restored for proxying.
+- **Stats endpoint IP restriction (H4)**: `/proxy/stats` is now restricted to localhost (`127.0.0.1` / `::1`) even when `--debug` is enabled. Remote clients receive HTTP 403.
+
+### Build
+
+- **Docker build support**: `build.sh` now accepts `--docker` to build the native binary inside `golang:1.26.1-alpine`, ensuring correct Go version without requiring Go on the host.
+- **Dockerfile pinned**: Builder image pinned to `golang:1.26.1-alpine` (exact patch) instead of mutable `golang:1.24-alpine`.
+- **Go version**: `go.mod` updated from `go 1.24.13` to `go 1.26.1`.
+
 ## v0.4.0 (2026-03-08)
 
 ### Security
@@ -23,7 +37,7 @@
 ### Accepted Risks (Documented)
 
 - **M3**: Prompt content previews in debug-mode logs — gated behind `--debug`.
-- **M4**: Stats endpoint accessible to any client in debug mode — gated behind `--debug`.
+- **M4**: Stats endpoint accessible to any client in debug mode — gated behind `--debug`. **Resolved in v0.5.0** (localhost restriction added).
 - **M8**: Dockerfile image tags use mutable tags, not SHA256 digests — deferred to CI pipeline.
 - **M10**: `json.Unmarshal` parses full message array — plan in `reports/json-unmarshal-fix-plan.md`.
 - **L1**: Backend names logged per-request — useful for operations.
@@ -35,7 +49,7 @@
 
 - Default listen address changed from `:7888` (all interfaces) to `127.0.0.1:7888` (localhost only). Use `--listen 0.0.0.0:7888` for LAN access.
 - `/proxy/stats` endpoint now requires `--debug` flag (returns 404 without it).
-- `X-LLMProxy-Backend` and `X-LLMProxy-Route` response headers now require `--debug` flag.
+- `X-ReverseLLM-Backend` and `X-ReverseLLM-Route` response headers now require `--debug` flag.
 - Hash function changed from FNV-1a to salted maphash (`hash/maphash`). Hash values are not stable across restarts (sticky table is in-memory, so this has no practical impact).
 
 ### Security
@@ -116,7 +130,7 @@ Initial release.
 - **Automatic failover**: If the target backend for a session is down, routes to the next backend on the ring.
 - **SSE streaming**: `FlushInterval: -1` ensures token-by-token streaming responses are forwarded immediately.
 - **Stats endpoint**: `/proxy/stats` returns JSON with per-backend request counts, health status, and routing statistics.
-- **Debug headers**: `X-LLMProxy-Backend` and `X-LLMProxy-Route` on every proxied response.
+- **Debug headers**: `X-ReverseLLM-Backend` and `X-ReverseLLM-Route` on every proxied response.
 - **Graceful shutdown**: SIGINT/SIGTERM trigger clean connection draining (30s timeout).
 
 ### Background
